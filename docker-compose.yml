@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16
+    container_name: prepareup_db
+    environment:
+      POSTGRES_DB: prepareup
+      POSTGRES_USER: prepareup
+      POSTGRES_PASSWORD: prepareup_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prepareup -d prepareup"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  backend:
+    build:
+      context: ./backend
+    container_name: prepareup_backend
+    environment:
+      ENV: local
+      DATABASE_URL: postgresql+psycopg://prepareup:prepareup_password@db:5432/prepareup
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: prepareup_frontend
+    environment:
+      # Next.js can read this at runtime/build-time depending on usage
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
