@@ -1,77 +1,43 @@
-
-
 "use client";
-
-/**
- * Prepare‑Up Dashboard (UI shell)
- *
- * Goals (your current requirements):
- * 1) White background + pink→orange accent gradient (#EE0979 → #FF6A00)
- * 2) Glass UI cards on top (frosted / soft borders)
- * 3) No whole‑page scrolling (only sidebar list scroll + chat scroll)
- * 4) Chat layout: user messages on LEFT, AI messages on RIGHT
- * 5) “What should I make from your notes?” block on RIGHT
- * 6) Top right: user chip + hamburger button (opens RIGHT drawer)
- * 7) Background animation (optional) – subtle, stays behind UI, interactive ripples
- */
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
-type ChatMessage = {
-  id: string;
-  role: "user" | "ai";
-  title: string;
-  subtitle?: string;
-};
+type LocalFile = { id: string; file: File };
+
+function formatBytes(bytes: number) {
+  if (!bytes) return "0 B";
+  const k = 1024;
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  const v = bytes / Math.pow(k, i);
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+function isAllowed(file: File) {
+  // Sprint 1: accept almost any file type (PDF, docs, slides, images, audio/video, archives, etc.)
+  // We only reject empty files.
+  return file.size > 0;
+}
 
 export default function DashboardPage() {
   // Right drawer
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerRef = useRef<HTMLDivElement | null>(null);
 
-  // Three.js background mount
+  // Background mount
   const bgMountRef = useRef<HTMLDivElement | null>(null);
 
-  // Demo messages (static for now; later you’ll render real chat history)
-  const messages: ChatMessage[] = useMemo(
-    () => [
-      {
-        id: "u1",
-        role: "user",
-        title: "Hello",
-        subtitle: "I uploaded 3 files. Can you help me?"
-      },
-      {
-        id: "a1",
-        role: "ai",
-        title: "Hello, Nil",
-        subtitle: "Sources: 3 files • 1 channel"
-      },
-      {
-        id: "a2",
-        role: "ai",
-        title: "What should I make from your notes?",
-        subtitle: "Choose an output to begin"
-      }
-    ],
-    []
-  );
+  // Upload state (in-memory only)
+  const [files, setFiles] = useState<LocalFile[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const canContinue = files.length > 0;
 
   // -----------------------------
-  // 1) GLOBAL BEHAVIOR
+  // Global behavior (match your shell rules)
   // -----------------------------
-
-  // Close drawer on Esc
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDrawerOpen(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  // Disable whole-page scroll (we only want internal scroll areas)
   useEffect(() => {
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -80,17 +46,20 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // Close drawer when clicking outside the drawer panel
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDrawerOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   useEffect(() => {
     if (!drawerOpen) return;
-
     const onMouseDown = (e: MouseEvent) => {
-      const target = e.target as Node;
-      if (drawerRef.current && !drawerRef.current.contains(target)) {
-        setDrawerOpen(false);
-      }
+      const t = e.target as Node;
+      if (drawerRef.current && !drawerRef.current.contains(t)) setDrawerOpen(false);
     };
-
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [drawerOpen]);
@@ -246,7 +215,7 @@ export default function DashboardPage() {
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
     camera.position.z = 1;
 
-    // alpha:true so it can sit on white seamlessly
+    // alpha:true so it can sit on background seamlessly
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(dpr);
     renderer.setSize(window.innerWidth, window.innerHeight);
@@ -290,7 +259,7 @@ export default function DashboardPage() {
     waterTexture.magFilter = THREE.LinearFilter;
     waterTexture.needsUpdate = true;
 
-    // --- Shader material colors (match your gradient theme)
+    // --- Shader material colors (match locked “ocean” look)
     const material = new THREE.ShaderMaterial({
       vertexShader: shaders.vertexShader,
       fragmentShader: shaders.fragmentShader,
@@ -299,10 +268,12 @@ export default function DashboardPage() {
         u_resolution: { value: new THREE.Vector2(1, 1) },
         u_speed: { value: 1.05 },
 
+        // Ocean palette (as in locked design)
         u_color1: { value: new THREE.Vector3(0.10, 0.60, 1.00) },  // #1A99FF-ish
         u_color2: { value: new THREE.Vector3(0.00, 0.92, 0.85) },  // #00EBD9-ish
         u_color3: { value: new THREE.Vector3(0.55, 0.70, 1.00) },  // #8CB3FF-ish
         u_background:{ value: new THREE.Vector3(0.02, 0.03, 0.06) }, // deeper navy-black
+
         u_waterTexture: { value: waterTexture },
         u_waterStrength: { value: 0.42 },
         u_ripple_time: { value: -10.0 },
@@ -481,11 +452,10 @@ export default function DashboardPage() {
       const dist = Math.sqrt(dx * dx + dy * dy);
 
       if (dist > 2) {
-        const velocity = dist / 10;
-        const velocityInfluence = Math.min(velocity / 10, 2.0);
+        const v = dist / 10;
+        const velocityInfluence = Math.min(v / 10, 2.0);
         const baseIntensity = Math.min(dist / 28, 1.0);
 
-        // Lower intensity on white background
         const finalIntensity =
           baseIntensity * velocityInfluence * waterSettings.mouseIntensity * (Math.random() * 0.25 + 0.75);
 
@@ -527,8 +497,8 @@ export default function DashboardPage() {
       const dist = Math.sqrt(dx * dx + dy * dy);
 
       if (dist > 2) {
-        const velocity = dist / 10;
-        const velocityInfluence = Math.min(velocity / 10, 2.0);
+        const v = dist / 10;
+        const velocityInfluence = Math.min(v / 10, 2.0);
         const baseIntensity = Math.min(dist / 28, 1.0);
 
         const finalIntensity =
@@ -613,60 +583,62 @@ export default function DashboardPage() {
   }, [shaders]);
 
   // -----------------------------
-  // 4) UI
+  // Upload handlers (local only)
   // -----------------------------
+  const addFiles = (incoming: FileList | File[]) => {
+    const arr = Array.from(incoming).filter(isAllowed);
+
+    const existing = new Set(
+      files.map((x) => `${x.file.name}:${x.file.size}:${x.file.lastModified}`)
+    );
+
+    const next: LocalFile[] = [];
+    for (const f of arr) {
+      const key = `${f.name}:${f.size}:${f.lastModified}`;
+      if (!existing.has(key)) next.push({ id: crypto.randomUUID(), file: f });
+    }
+
+    if (next.length) setFiles((prev) => [...prev, ...next]);
+  };
+
+  const onBrowse = () => inputRef.current?.click();
+
+  const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files?.length) addFiles(e.target.files);
+    e.target.value = "";
+  };
+
+  const removeFile = (id: string) => setFiles((prev) => prev.filter((x) => x.id !== id));
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
+  };
+
+  const onContinue = () => {
+    if (!canContinue) return;
+    // Next step: show chat UI, and use FileReader to extract text (no backend).
+    alert("Next step: build chat UI + extract text in-memory (FileReader).");
+  };
 
   return (
     <div className="pu-root">
-      {/*
-        Global styles are scoped to this page via styled-jsx, but html/body rules are global.
-        This is intentional to guarantee “no whole page scroll”.
-      */}
       <style jsx global>{`
-        :root {
-          /* Black base + warm accent gradient */
-          --pu-bg: #07070b;
-          --pu-text: rgba(255, 255, 255, 0.92);
-          --pu-muted: rgba(255, 255, 255, 0.62);
+        * { box-sizing: border-box; }
+      `}</style>
 
-          --pu-accent-1: #ee0979;
-          --pu-accent-2: #ff6a00;
+      {/* background */}
+      <div ref={bgMountRef} className="pu-bg" aria-hidden="true" />
+      <div className="pu-vignette" aria-hidden="true" />
 
-          /* Glass on black (stronger, more premium) */
-          --pu-glass: rgba(255, 255, 255, 0.05);
-          --pu-glass-strong: rgba(255, 255, 255, 0.10);
-          --pu-border: rgba(255, 255, 255, 0.14);
-          --pu-border-soft: rgba(255, 255, 255, 0.10);
-          --pu-shadow: rgba(0, 0, 0, 0.55);
-        }
-
-        html,
-        body {
-          height: 100%;
-          background: var(--pu-bg);
-          overflow: hidden; /* stop whole page scroll */
-          color: var(--pu-text);
-          font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial,
-            "Apple Color Emoji", "Segoe UI Emoji";
-          -webkit-font-smoothing: antialiased;
-          -moz-osx-font-smoothing: grayscale;
-        }
-
-        * {
-          box-sizing: border-box;
-        }
-
-        /* Background canvas mount */
-        .pu-bg-canvas {
+      <style jsx>{`
+        .pu-bg {
           position: fixed;
           inset: 0;
           z-index: 0;
-          background: radial-gradient(1200px 800px at 20% 15%, rgba(238, 9, 121, 0.10), transparent 55%),
-            radial-gradient(900px 700px at 85% 80%, rgba(255, 106, 0, 0.10), transparent 60%),
-            var(--pu-bg);
+          background: var(--pu-bg);
         }
-
-        /* Vignette for depth */
         .pu-vignette {
           position: fixed;
           inset: 0;
@@ -679,7 +651,6 @@ export default function DashboardPage() {
           );
         }
 
-        /* Root viewport (fixed) */
         .pu-root {
           position: relative;
           height: 100vh;
@@ -687,7 +658,6 @@ export default function DashboardPage() {
           overflow: hidden;
         }
 
-        /* Layout: sidebar + main */
         .pu-shell {
           position: relative;
           z-index: 2;
@@ -697,23 +667,6 @@ export default function DashboardPage() {
           gap: 14px;
         }
 
-        /* Glass panel base */
-        .pu-glass {
-          background: var(--pu-glass);
-          backdrop-filter: blur(20px) saturate(150%);
-          -webkit-backdrop-filter: blur(22px) saturate(150%);
-          border: 1px solid var(--pu-border-soft);
-          outline: 1px solid rgba(255, 255, 255, 0.06);
-          outline-offset: -1px;
-          box-shadow: 0 24px 70px var(--pu-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-          border-radius: 18px;
-        }
-
-        .pu-glass-strong {
-          background: var(--pu-glass-strong);
-        }
-
-        /* Sidebar */
         .pu-sidebar {
           padding: 14px;
           display: flex;
@@ -794,14 +747,13 @@ export default function DashboardPage() {
           color: var(--pu-muted);
         }
 
-        /* Main */
         .pu-main {
           display: flex;
           flex-direction: column;
           overflow: hidden;
+          min-width: 0;
         }
 
-        /* Top bar (RIGHT aligned chip + hamburger) */
         .pu-topbar {
           padding: 12px 14px 10px 14px;
           display: flex;
@@ -833,9 +785,9 @@ export default function DashboardPage() {
           );
           display: grid;
           place-items: center;
-          color: rgba(255, 255, 255, 0.92);
           font-weight: 950;
           font-size: 12px;
+          color: rgba(255, 255, 255, 0.92);
         }
 
         .pu-userHint {
@@ -871,128 +823,168 @@ export default function DashboardPage() {
           transform: translateY(-1px);
         }
 
-        /* Internal scroll: chat area only */
+        /* Center content is empty chat + upload gate */
         .pu-content {
           flex: 1;
+          min-height: 0;
           overflow-y: auto;
           overflow-x: hidden;
           padding: 18px;
+          display: grid;
+          place-items: center;
+        }
+
+        .pu-uploadCard {
+          width: min(860px, 100%);
+          padding: 16px;
+        }
+
+        .pu-titleRow {
           display: flex;
-          flex-direction: column;
-          gap: 14px;
+          align-items: flex-end;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+          flex-wrap: wrap;
         }
 
-        /* Chat bubbles */
-        .pu-bubble {
-          max-width: 560px;
-          padding: 14px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-        }
-
-        .pu-bubble.user {
-          margin-right: auto;
-        }
-
-        .pu-bubble.ai {
-          margin-left: auto;
-          background: 
-            rgba(255, 255, 255, 0.05);
-          border-color: rgba(255, 255, 255, 0.14);
-        }
-
-        .pu-bTitle {
-          font-size: 13px;
-          font-weight: 900;
-          letter-spacing: -0.01em;
+        .pu-h1 {
+          font-size: 18px;
+          font-weight: 950;
+          letter-spacing: -0.02em;
           color: var(--pu-text);
         }
 
-        .pu-bSub {
+        .pu-desc {
           margin-top: 6px;
           font-size: 13px;
+          color: var(--pu-muted);
           line-height: 1.45;
-          color: rgba(255, 255, 255, 0.72);
         }
 
-        .pu-chips {
-          display: flex;
-          gap: 10px;
-          justify-content: flex-end;
-          flex-wrap: wrap;
-          margin-top: 2px;
-        }
-
-        .pu-chip {
-          padding: 9px 12px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          background: rgba(255, 255, 255, 0.06);
-          cursor: pointer;
-          font-size: 12px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.90);
-          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-        }
-
-        .pu-chip:hover {
-          background: linear-gradient(
-            90deg,
-            rgba(238, 9, 121, 0.16),
-            rgba(255, 106, 0, 0.16)
-          );
-          border-color: rgba(255, 255, 255, 0.18);
-          transform: translateY(-1px);
-        }
-
-        .pu-inputRow {
-          padding: 14px 18px;
-          border-top: 1px solid rgba(255, 255, 255, 0.06);
+        .pu-btnRow {
           display: flex;
           gap: 10px;
           align-items: center;
         }
 
-        .pu-input {
-          flex: 1;
-          padding: 12px 14px;
-          border-radius: 16px;
+        .pu-btn {
+          padding: 10px 12px;
+          border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
           background: rgba(255, 255, 255, 0.06);
-          outline: none;
           color: var(--pu-text);
-          font-size: 14px;
+          font-size: 12px;
+          font-weight: 900;
+          cursor: pointer;
         }
 
-        .pu-input::placeholder {
-          color: rgba(255, 255, 255, 0.45);
-        }
-
-        .pu-send {
-          width: 46px;
-          height: 46px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.14);
+        .pu-btnPrimary {
           background: linear-gradient(
             90deg,
             rgba(238, 9, 121, 0.22),
             rgba(255, 106, 0, 0.22)
           );
+        }
+
+        .pu-btnDisabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
+
+        .pu-drop {
+          margin-top: 12px;
+          border-radius: 16px;
+          border: 1px dashed rgba(255, 255, 255, 0.18);
+          background: rgba(255, 255, 255, 0.05);
+          padding: 18px;
+          transition: background 120ms ease, border-color 120ms ease;
+        }
+
+        .pu-drop.drag {
+          background: rgba(255, 255, 255, 0.075);
+          border-color: rgba(255, 255, 255, 0.28);
+        }
+
+        .pu-dropInner {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 14px;
+          flex-wrap: wrap;
+        }
+
+        .pu-dropLeft {
+          min-width: 240px;
+        }
+
+        .pu-dropTitle {
+          font-weight: 900;
+          font-size: 14px;
+          color: var(--pu-text);
+        }
+
+        .pu-dropSub {
+          margin-top: 6px;
+          font-size: 12px;
+          color: var(--pu-muted);
+        }
+
+        .pu-fileList {
+          margin-top: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          max-height: 240px;
+          overflow: auto;
+          padding-right: 6px;
+        }
+
+        .pu-fileItem {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 12px;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.06);
+        }
+
+        .pu-fileMeta {
+          min-width: 0;
+        }
+
+        .pu-fileName {
+          font-size: 13px;
+          font-weight: 900;
+          color: var(--pu-text);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          max-width: 560px;
+        }
+
+        .pu-fileSize {
+          margin-top: 4px;
+          font-size: 12px;
+          color: var(--pu-muted);
+        }
+
+        .pu-remove {
+          width: 40px;
+          height: 40px;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.06);
           cursor: pointer;
           display: grid;
           place-items: center;
-          color: rgba(255, 255, 255, 0.94);
+          color: rgba(255, 255, 255, 0.9);
           font-weight: 900;
-          font-size: 18px;
-          transition: transform 120ms ease, filter 120ms ease;
         }
 
-        .pu-send:hover {
-          transform: translateY(-1px);
-          filter: brightness(1.10);
-        }
-
+        /* Drawer */
         .pu-overlay {
           position: fixed;
           inset: 0;
@@ -1040,21 +1032,6 @@ export default function DashboardPage() {
           color: var(--pu-text);
         }
 
-        .pu-btn {
-          padding: 9px 12px;
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-          cursor: pointer;
-          font-size: 12px;
-          font-weight: 900;
-          color: var(--pu-text);
-        }
-
-        .pu-btn:hover {
-          background: rgba(255, 255, 255, 0.08);
-        }
-
         .pu-card {
           padding: 12px;
           border-radius: 14px;
@@ -1085,86 +1062,122 @@ export default function DashboardPage() {
         }
       `}</style>
 
-      {/* Background animation layers */}
-      <div ref={bgMountRef} className="pu-bg-canvas" aria-hidden="true" />
-      <div className="pu-vignette" aria-hidden="true" />
-
-      {/* App shell */}
       <div className="pu-shell">
-        {/* Left sidebar: recent projects */}
-        <aside className="pu-glass pu-sidebar" aria-label="Recent projects">
-          <div className="pu-brand">Prepare‑Up</div>
+        {/* Sidebar */}
+        <aside className="pu-glass pu-sidebar">
+          <div className="pu-brand">Prepare-Up</div>
           <div className="pu-subtitle">Recent projects</div>
-
           <div className="pu-search">
             <SearchIcon />
             <input placeholder="Search projects…" />
           </div>
-
           <div className="pu-list">
-            <SidebarItem title="Software Development StudyGuide" sub="Last opened • Today" />
-            <SidebarItem title="Compiler Designing" sub="Last opened • Yesterday" />
-            <SidebarItem title="AI Study Guide Midterm" sub="Last opened • 2 days ago" />
-            <SidebarItem title="Automated Theory Finals" sub="Last opened • 4 days ago" />
-            <SidebarItem title="Mobile Computing Design" sub="Last opened • 1 week ago" />
-            <SidebarItem title="Wireless Network Study Guide" sub="Last opened • 2 weeks ago" />
+            <div className="pu-item">
+              <div className="pu-itemTitle">Software Dev StudyGuide</div>
+              <div className="pu-itemSub">Last opened • Today</div>
+            </div>
+            <div className="pu-item">
+              <div className="pu-itemTitle">Compiler Designing</div>
+              <div className="pu-itemSub">Last opened • Yesterday</div>
+            </div>
+            <div className="pu-item">
+              <div className="pu-itemTitle">AI Midterm Notes</div>
+              <div className="pu-itemSub">Last opened • 2 days ago</div>
+            </div>
           </div>
         </aside>
 
-        {/* Main workspace */}
-        <main className="pu-glass pu-main" aria-label="Chat workspace">
-          {/* Top bar (right aligned) */}
+        {/* Main */}
+        <main className="pu-glass pu-main">
           <div className="pu-topbar">
             <div className="pu-userChip">
-              <div className="pu-avatar" aria-hidden="true">
-                N
-              </div>
+              <div className="pu-avatar">N</div>
               <div>
                 <div className="pu-userHint">Good morning</div>
                 <div className="pu-userName">Nil Vaghela</div>
               </div>
             </div>
-
-            <button
-              className="pu-hamburger"
-              aria-label="Open right sidebar"
-              onClick={() => setDrawerOpen(true)}
-              type="button"
-            >
+            <button className="pu-hamburger" onClick={() => setDrawerOpen(true)} aria-label="Open menu">
               <HamburgerIcon />
             </button>
           </div>
-
-          {/* Chat scroll area */}
-          <div className="pu-content">
-            {messages.map((m) => (
-              <div key={m.id} className={`pu-bubble ${m.role}`}
-                role="article"
-                aria-label={m.role === "ai" ? "Assistant message" : "User message"}
-              >
-                <div className="pu-bTitle">{m.title}</div>
-                {m.subtitle ? <div className="pu-bSub">{m.subtitle}</div> : null}
+          <div
+            className="pu-content"
+            onDragEnter={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={(e) => {
+              e.preventDefault();
+              setDragging(false);
+            }}
+            onDrop={onDrop}
+          >
+            <div className="pu-glass pu-uploadCard">
+              <div className="pu-titleRow">
+                <div>
+                  <div className="pu-h1">Upload your notes</div>
+                  <div className="pu-desc">
+                    Add PDFs, docs, slides, images, audio/video, code, archives — anything. Next step will be chat + generation options.
+                  </div>
+                </div>
+                <div className="pu-btnRow">
+                  <button className="pu-btn" onClick={onBrowse} type="button">
+                    Browse
+                  </button>
+                  <button
+                    className={`pu-btn pu-btnPrimary ${!canContinue ? "pu-btnDisabled" : ""}`}
+                    onClick={onContinue}
+                    disabled={!canContinue}
+                    type="button"
+                  >
+                    Continue
+                  </button>
+                </div>
               </div>
-            ))}
-
-            {/* Output chips: right aligned */}
-            <div className="pu-chips" aria-label="Output options">
-              <button className="pu-chip" type="button">Podcast</button>
-              <button className="pu-chip" type="button">Study Guide</button>
-              <button className="pu-chip" type="button">Narrative</button>
-              <button className="pu-chip" type="button">Flash Card</button>
+              <div className={`pu-drop${dragging ? " drag" : ""}`}>
+                <div className="pu-dropInner">
+                  <div className="pu-dropLeft">
+                    <div className="pu-dropTitle">Drag & drop files here</div>
+                    <div className="pu-dropSub">
+                      Supported: most file types (PDF/DOCX/PPTX/IMG/AUDIO/VIDEO/etc.) • No storage yet (local only)
+                    </div>
+                  </div>
+                  <div className="pu-btnRow">
+                    <button className="pu-btn" onClick={onBrowse} type="button">
+                      Select files
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <input
+                ref={inputRef}
+                type="file"
+                multiple
+                hidden
+                onChange={onInputChange}
+                accept="*/*"
+              />
+              {files.length > 0 ? (
+                <div className="pu-fileList" aria-label="Selected files">
+                  {files.map((f) => (
+                    <div key={f.id} className="pu-fileItem">
+                      <div className="pu-fileMeta">
+                        <div className="pu-fileName">{f.file.name}</div>
+                        <div className="pu-fileSize">{formatBytes(f.file.size)}</div>
+                      </div>
+                      <button className="pu-remove" onClick={() => removeFile(f.id)} aria-label="Remove file">
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
-
-            {/* Spacer so input doesn’t stick to last bubble */}
-            <div style={{ height: 12 }} />
-          </div>
-
-          {/* Input row */}
-          <div className="pu-inputRow">
-            <input className="pu-input" placeholder="Ask me anything about your projects" />
-            <button className="pu-send" aria-label="Send" type="button">
-              ➤
-            </button>
           </div>
         </main>
       </div>
@@ -1186,24 +1199,19 @@ export default function DashboardPage() {
 
           <div className="pu-card">
             <div className="pu-cardTitle">Upload</div>
-            <div className="pu-cardSub">Add PDFs, docs, or Discord exports.</div>
+            <div className="pu-cardSub">Add any files. Next: extract content + chat.</div>
           </div>
 
           <div className="pu-card">
             <div className="pu-cardTitle">Generate</div>
-            <div className="pu-cardSub">Podcast, study guide, narrative, flashcards, quizzes.</div>
-          </div>
-
-          <div className="pu-card">
-            <div className="pu-cardTitle">Preferences</div>
-            <div className="pu-cardSub">Voice, tone, difficulty, time budget.</div>
+            <div className="pu-cardSub">Podcast, study guide, flashcards, quizzes (next sprint).</div>
           </div>
 
           <div style={{ flex: 1 }} />
 
           <div className="pu-card">
             <div className="pu-cardTitle">Account</div>
-            <div className="pu-cardSub">Profile, billing, workspace settings.</div>
+            <div className="pu-cardSub">Anonymous for Sprint 1.</div>
           </div>
         </div>
       </aside>
@@ -1211,22 +1219,16 @@ export default function DashboardPage() {
   );
 }
 
-/* ------------------------------
- * Sidebar item component
- * ------------------------------ */
-function SidebarItem({ title, sub }: { title: string; sub: string }) {
+function HamburgerIcon() {
   return (
-    <div className="pu-item" role="button" tabIndex={0}>
-      <div className="pu-itemTitle">{title}</div>
-      <div className="pu-itemSub">{sub}</div>
-    </div>
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M5 7h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
+      <path d="M5 12h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
+      <path d="M5 17h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
+    </svg>
   );
 }
 
-/* ------------------------------
- * Minimal inline icons
- * (kept inline so this file is self-contained)
- * ------------------------------ */
 function SearchIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -1241,16 +1243,6 @@ function SearchIcon() {
         strokeWidth="2"
         strokeLinecap="round"
       />
-    </svg>
-  );
-}
-
-function HamburgerIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M5 7h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
-      <path d="M5 12h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
-      <path d="M5 17h14" stroke="rgba(255,255,255,0.90)" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
