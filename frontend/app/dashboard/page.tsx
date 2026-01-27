@@ -616,10 +616,50 @@ export default function DashboardPage() {
     if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
   };
 
-  const onContinue = () => {
+  const onContinue = async () => {
     if (!canContinue) return;
-    // Next step: show chat UI, and use FileReader to extract text (no backend).
-    alert("Next step: build chat UI + extract text in-memory (FileReader).");
+
+    const form = new FormData();
+    for (const f of files) {
+      form.append("files", f.file); // IMPORTANT: key must match backend param name
+    }
+
+    const res = await fetch("http://localhost:8000/api/upload", {
+      method: "POST",
+      body: form,
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      alert(`Upload failed: ${msg}`);
+      return;
+    }
+
+    const data = await res.json();
+
+    // For now: just show how much text you extracted (proof it's working)
+    const extractedCount = data.files.filter((x: any) => x.status === "extracted").length;
+    const needsOcrCount = data.files.filter((x: any) => x.status === "needs_ocr").length;
+    console.log("/api/upload response:", data);
+
+    // canonical per-file text (best)
+    console.log(
+      "Per-file extracted text:",
+      data.files?.map((f: any) => ({
+        name: f.name,
+        status: f.status,
+        chars: (f.text || "").length,
+        preview: (f.text || "").slice(0, 300),
+      }))
+    );
+
+    // shortcut combined text (good for quick prototype)
+    console.log("Combined text preview:", (data.combined_text || "").slice(0, 1000));
+    alert(
+      `Done.\nExtracted: ${extractedCount}\nNeeds OCR: ${needsOcrCount}\nCombined text length: ${data.combined_text?.length || 0}`
+    );
+
+    // Next sprint: store data.combined_text in state and open chat view
   };
 
   return (
