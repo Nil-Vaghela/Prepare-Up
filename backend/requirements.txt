@@ -4,3 +4,10 @@ sqlalchemy==2.0.36
 psycopg[binary]==3.2.3
 pydantic-settings==2.6.1
 alembic==1.13.1
+fastapi
+uvicorn[standard]
+python-multipart
+pypdf
+python-docx
+python-pptx
+pydantic_settings
