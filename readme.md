@@ -138,6 +138,17 @@ prepare-up/
 
 ---
 
+
+
+
+## UI Status
+- Dashboard UI (glass + black theme) is locked
+- Do NOT refactor layout or styles without discussion
+- All upcoming work should focus on functionality:
+  - Projects
+  - Uploads
+  - Chat
+
 ## Status
 
 ✅ Infrastructure ready  
