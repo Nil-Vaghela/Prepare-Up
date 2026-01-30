@@ -5,6 +5,25 @@ import * as THREE from "three";
 
 type LocalFile = { id: string; file: File };
 
+type UploadedFile = {
+  id: string;
+  name: string;
+  status: "extracted" | "needs_ocr" | "error" | string;
+  textLen: number;
+};
+
+type OutputType = "podcast" | "study_guide" | "narrative" | "flash_card";
+type ChatRole = "user" | "ai";
+
+type ChatMessage = {
+  id: string;
+  role: ChatRole;
+  title?: string;
+  meta?: string;
+  text: string;
+  loading?: boolean;
+};
+
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
   const k = 1024;
@@ -15,8 +34,6 @@ function formatBytes(bytes: number) {
 }
 
 function isAllowed(file: File) {
-  // Sprint 1: accept almost any file type (PDF, docs, slides, images, audio/video, archives, etc.)
-  // We only reject empty files.
   return file.size > 0;
 }
 
@@ -33,10 +50,33 @@ export default function DashboardPage() {
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const canContinue = files.length > 0;
+  // Views
+  const [view, setView] = useState<"upload" | "chat">("upload");
+
+  // Extracted sources summary
+  const [uploaded, setUploaded] = useState<UploadedFile[]>([]);
+  const [channelsCount] = useState(1);
+  const [combinedTextLen, setCombinedTextLen] = useState<number>(0);
+
+  // Status
+  const [uploading, setUploading] = useState(false);
+  const [generating, setGenerating] = useState(false);
+
+  // Chat
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
+
+  const canContinue = files.length > 0 && !uploading;
+
+  // Auto-upload-more behavior (no sync button)
+  const pendingUploadCount = Math.max(0, files.length - uploaded.length);
+  const autoSyncLockRef = useRef(false);
+  const lastAutoUploadKeyRef = useRef<string>("");
 
   // -----------------------------
-  // Global behavior (match your shell rules)
+  // Global behavior
   // -----------------------------
   useEffect(() => {
     const prev = document.body.style.overflow;
@@ -64,14 +104,15 @@ export default function DashboardPage() {
     return () => document.removeEventListener("mousedown", onMouseDown);
   }, [drawerOpen]);
 
-  // -----------------------------
-  // 2) SHADERS (SUBTLE BACKGROUND)
-  // -----------------------------
+  useEffect(() => {
+    const el = chatListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages.length]);
 
-  /**
-   * Keep shaders stable across renders.
-   * IMPORTANT: We keep the background subtle (lower alpha) so it doesn’t disturb reading.
-   */
+  // -----------------------------
+  // Background shaders (cool glass vibe)
+  // -----------------------------
   const shaders = useMemo(() => {
     const vertexShader = `
       varying vec2 vUv;
@@ -81,10 +122,7 @@ export default function DashboardPage() {
       }
     `;
 
-    // Water + swirl circle with click ripple
-    // - no text
-    // - no audio
-    // - softened alpha so it looks like a premium ambient blob
+    // Cooler blue/green blob, less “warm”
     const fragmentShader = `
       uniform float u_time;
       uniform vec2 u_resolution;
@@ -104,14 +142,12 @@ export default function DashboardPage() {
         vec2 FC = gl_FragCoord.xy;
         vec2 screenP = (FC.xy * 2.0 - r) / r.y;
 
-        // Sample water height
         vec2 wCoord = vec2(FC.x / r.x, FC.y / r.y);
         float waterHeight = texture2D(u_waterTexture, wCoord).r;
         float waterInfluence = clamp(waterHeight * u_waterStrength, -0.5, 0.5);
 
-        // Circle: keep smaller (background element)
         float baseRadius = 0.44;
-        float waterPulse = waterInfluence * 0.14;
+        float waterPulse = waterInfluence * 0.12;
         float circleRadius = baseRadius + waterPulse;
 
         float distFromCenter = length(screenP);
@@ -121,10 +157,8 @@ export default function DashboardPage() {
         float alpha = 1.0;
 
         if (inCircle > 0.0) {
-          // Internal scale: smaller pattern = smaller perceived blob
           vec2 p = screenP * 0.82;
 
-          // Click ripple ring
           float rippleTime = u_time - u_ripple_time;
           vec2 ripplePos = u_ripple_position * r;
           float rippleDist = distance(FC.xy, ripplePos);
@@ -139,32 +173,27 @@ export default function DashboardPage() {
 
           float totalWater = clamp((waterInfluence + clickRipple * 0.10) * u_waterStrength, -0.8, 0.8);
 
-          // Swirl rotation
           float angle = length(p) * 4.0;
           mat2 R = mat2(cos(angle), -sin(angle), sin(angle), cos(angle));
           p *= R;
 
-          float l = length(p) - 0.7 + totalWater * 0.55;
+          float l = length(p) - 0.7 + totalWater * 0.50;
           float t = u_time * u_speed + totalWater * 2.0;
-          float enhancedY = p.y + totalWater * 0.32;
+          float enhancedY = p.y + totalWater * 0.28;
 
           float pattern1 = 0.5 + 0.5 * tanh(0.1 / max(l / 0.1, -l) - sin(l + enhancedY * max(1.0, -l / 0.1) + t));
           float pattern2 = 0.5 + 0.5 * tanh(0.1 / max(l / 0.1, -l) - sin(l + enhancedY * max(1.0, -l / 0.1) + t + 1.0));
           float pattern3 = 0.5 + 0.5 * tanh(0.1 / max(l / 0.1, -l) - sin(l + enhancedY * max(1.0, -l / 0.1) + t + 2.0));
 
-          float intensity = 1.0 + totalWater * 0.55;
+          float intensity = 1.0 + totalWater * 0.40;
 
-          // Mix your warm gradient palette
           vec3 blob;
           blob.r = pattern1 * u_color1.r * intensity;
           blob.g = pattern2 * u_color2.g * intensity;
           blob.b = pattern3 * u_color3.b * intensity;
 
-          // IMPORTANT: soften so it’s not distracting
-          float blobAlpha = inCircle * 0.50;   // overall visibility of blob
+          float blobAlpha = inCircle * 0.40; // cooler + slightly dimmer
           col = mix(u_background, blob, blobAlpha);
-
-          // Keep alpha fully opaque because we already mix into background color.
           alpha = 1.0;
         }
 
@@ -175,17 +204,12 @@ export default function DashboardPage() {
     return { vertexShader, fragmentShader };
   }, []);
 
-  // -----------------------------
-  // 3) THREE.JS BACKGROUND
-  // -----------------------------
-
   useEffect(() => {
     const mount = bgMountRef.current;
     if (!mount) return;
 
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
-    // Adaptive sim resolution: keeps it smooth & battery-friendly
     const simResolution = (() => {
       const w = window.innerWidth;
       if (w < 520) return 128;
@@ -193,60 +217,69 @@ export default function DashboardPage() {
       return 256;
     })();
 
-    // You can tune these later (they control ripple feel)
     const waterSettings = {
       resolution: simResolution,
       damping: 0.913,
       tension: 0.02,
       rippleRadius: 8,
       mouseIntensity: 1.0,
-      clickIntensity: 2.5,
+      clickIntensity: 2.4,
       impactForce: 50000,
       rippleSize: 0.10,
-      spiralIntensity: 0.20,
-      swirlingMotion: 0.18,
+      spiralIntensity: 0.18,
+      swirlingMotion: 0.16,
       motionDecay: 0.08,
       rippleDecay: 1.0,
-      waveHeight: 0.010
+      waveHeight: 0.010,
     };
 
-    // --- Three scene
     const scene = new THREE.Scene();
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
     camera.position.z = 1;
 
-    // alpha:true so it can sit on background seamlessly
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setPixelRatio(dpr);
     renderer.setSize(window.innerWidth, window.innerHeight);
 
-    // Make sure gl_FragCoord calculations match drawing buffer size on retina
+    const material = new THREE.ShaderMaterial({
+      vertexShader: shaders.vertexShader,
+      fragmentShader: shaders.fragmentShader,
+      uniforms: {
+        u_time: { value: 0.0 },
+        u_resolution: { value: new THREE.Vector2(1, 1) },
+        u_speed: { value: 1.02 },
+
+        // Cooler palette (match your screenshot vibe)
+        u_color1: { value: new THREE.Vector3(0.10, 0.55, 1.0) }, // blue
+        u_color2: { value: new THREE.Vector3(0.00, 0.75, 0.55) }, // green-teal
+        u_color3: { value: new THREE.Vector3(0.35, 0.55, 1.0) }, // softer blue
+        u_background: { value: new THREE.Vector3(0.02, 0.03, 0.05) }, // near-black
+
+        u_waterTexture: { value: null },
+        u_waterStrength: { value: 0.40 },
+        u_ripple_time: { value: -10.0 },
+        u_ripple_position: { value: new THREE.Vector2(0.5, 0.5) },
+        u_ripple_strength: { value: 0.50 },
+      },
+      transparent: true,
+    });
+
     const syncResolutionUniform = () => {
       const v = new THREE.Vector2();
       renderer.getDrawingBufferSize(v);
       material.uniforms.u_resolution.value.copy(v);
     };
 
-    // Mount safety for hot reload
     mount.innerHTML = "";
     mount.appendChild(renderer.domElement);
 
-    // --- Water buffers
     const resolution = waterSettings.resolution;
     let waterBuffers = {
       current: new Float32Array(resolution * resolution),
       previous: new Float32Array(resolution * resolution),
       velocity: new Float32Array(resolution * resolution * 2),
-      vorticity: new Float32Array(resolution * resolution)
+      vorticity: new Float32Array(resolution * resolution),
     };
-
-    for (let i = 0; i < resolution * resolution; i++) {
-      waterBuffers.current[i] = 0.0;
-      waterBuffers.previous[i] = 0.0;
-      waterBuffers.velocity[i * 2] = 0.0;
-      waterBuffers.velocity[i * 2 + 1] = 0.0;
-      waterBuffers.vorticity[i] = 0.0;
-    }
 
     const waterTexture = new THREE.DataTexture(
       waterBuffers.current,
@@ -259,29 +292,7 @@ export default function DashboardPage() {
     waterTexture.magFilter = THREE.LinearFilter;
     waterTexture.needsUpdate = true;
 
-    // --- Shader material colors (match locked “ocean” look)
-    const material = new THREE.ShaderMaterial({
-      vertexShader: shaders.vertexShader,
-      fragmentShader: shaders.fragmentShader,
-      uniforms: {
-        u_time: { value: 0.0 },
-        u_resolution: { value: new THREE.Vector2(1, 1) },
-        u_speed: { value: 1.05 },
-
-        // Ocean palette (as in locked design)
-        u_color1: { value: new THREE.Vector3(0.10, 0.60, 1.00) },  // #1A99FF-ish
-        u_color2: { value: new THREE.Vector3(0.00, 0.92, 0.85) },  // #00EBD9-ish
-        u_color3: { value: new THREE.Vector3(0.55, 0.70, 1.00) },  // #8CB3FF-ish
-        u_background:{ value: new THREE.Vector3(0.02, 0.03, 0.06) }, // deeper navy-black
-
-        u_waterTexture: { value: waterTexture },
-        u_waterStrength: { value: 0.42 },
-        u_ripple_time: { value: -10.0 },
-        u_ripple_position: { value: new THREE.Vector2(0.5, 0.5) },
-        u_ripple_strength: { value: 0.55 }
-      },
-      transparent: true
-    });
+    material.uniforms.u_waterTexture.value = waterTexture;
 
     const geometry = new THREE.PlaneGeometry(2, 2);
     const mesh = new THREE.Mesh(geometry, material);
@@ -289,7 +300,6 @@ export default function DashboardPage() {
 
     syncResolutionUniform();
 
-    // --- Water simulation step
     const updateWaterSimulation = () => {
       const { current, previous, velocity, vorticity } = waterBuffers;
       const damping = waterSettings.damping;
@@ -298,12 +308,8 @@ export default function DashboardPage() {
       const densityDissipation = waterSettings.rippleDecay;
       const vorticityInfluence = Math.min(Math.max(waterSettings.swirlingMotion, 0.0), 0.5);
 
-      // Dissipate velocity
-      for (let i = 0; i < resolution * resolution * 2; i++) {
-        velocity[i] *= 1.0 - velocityDissipation;
-      }
+      for (let i = 0; i < resolution * resolution * 2; i++) velocity[i] *= 1.0 - velocityDissipation;
 
-      // Compute vorticity
       for (let i = 1; i < resolution - 1; i++) {
         for (let j = 1; j < resolution - 1; j++) {
           const index = i * resolution + j;
@@ -315,7 +321,6 @@ export default function DashboardPage() {
         }
       }
 
-      // Apply vorticity forces
       if (vorticityInfluence > 0.001) {
         for (let i = 1; i < resolution - 1; i++) {
           for (let j = 1; j < resolution - 1; j++) {
@@ -342,7 +347,6 @@ export default function DashboardPage() {
         }
       }
 
-      // Wave propagation (no wrapping)
       for (let i = 1; i < resolution - 1; i++) {
         for (let j = 1; j < resolution - 1; j++) {
           const index = i * resolution + j;
@@ -358,10 +362,8 @@ export default function DashboardPage() {
           current[index] += (0 - previous[index]) * safeTension;
 
           const velMagnitude = Math.sqrt(
-            velocity[velIndex] * velocity[velIndex] +
-              velocity[velIndex + 1] * velocity[velIndex + 1]
+            velocity[velIndex] * velocity[velIndex] + velocity[velIndex + 1] * velocity[velIndex + 1]
           );
-
           const safeVelInfluence = Math.min(velMagnitude * waterSettings.waveHeight, 0.1);
           current[index] += safeVelInfluence;
 
@@ -370,7 +372,6 @@ export default function DashboardPage() {
         }
       }
 
-      // Zero boundaries (prevents edge wrapping artifacts)
       for (let i = 0; i < resolution; i++) {
         current[i] = 0;
         current[(resolution - 1) * resolution + i] = 0;
@@ -378,7 +379,6 @@ export default function DashboardPage() {
         current[i * resolution + (resolution - 1)] = 0;
       }
 
-      // Swap current/previous
       const tmp = waterBuffers.current;
       waterBuffers.current = waterBuffers.previous;
       waterBuffers.previous = tmp;
@@ -387,7 +387,6 @@ export default function DashboardPage() {
       waterTexture.needsUpdate = true;
     };
 
-    // Add ripple impulse at position
     const addRipple = (x: number, y: number, strength = 1.0) => {
       const normalizedX = x / window.innerWidth;
       const normalizedY = 1.0 - y / window.innerHeight;
@@ -413,8 +412,7 @@ export default function DashboardPage() {
               const distance = Math.sqrt(dist2);
               const falloff = 1.0 - distance / radius;
 
-              const rippleValue =
-                Math.cos((distance / radius) * Math.PI * 0.5) * rippleStrength * falloff;
+              const rippleValue = Math.cos((distance / radius) * Math.PI * 0.5) * rippleStrength * falloff;
 
               waterBuffers.previous[index] += rippleValue;
 
@@ -424,7 +422,6 @@ export default function DashboardPage() {
               waterBuffers.velocity[velIndex] += Math.cos(angle) * velStrength;
               waterBuffers.velocity[velIndex + 1] += Math.sin(angle) * velStrength;
 
-              // Small swirl
               const swirlAngle = angle + Math.PI * 0.5;
               const swirlStrength = Math.min(velStrength * 0.3, 0.1);
               waterBuffers.velocity[velIndex] += Math.cos(swirlAngle) * swirlStrength;
@@ -435,13 +432,12 @@ export default function DashboardPage() {
       }
     };
 
-    // Interaction (mousemove + click + touch)
     let lastMouse = { x: 0, y: 0 };
     let mouseThrottle = 0;
 
     const onMouseMove = (event: MouseEvent) => {
       const now = performance.now();
-      if (now - mouseThrottle < 10) return; // a touch slower = less distracting
+      if (now - mouseThrottle < 12) return;
       mouseThrottle = now;
 
       const x = event.clientX;
@@ -454,16 +450,11 @@ export default function DashboardPage() {
       if (dist > 2) {
         const v = dist / 10;
         const velocityInfluence = Math.min(v / 10, 2.0);
-        const baseIntensity = Math.min(dist / 28, 1.0);
-
+        const baseIntensity = Math.min(dist / 30, 1.0);
         const finalIntensity =
           baseIntensity * velocityInfluence * waterSettings.mouseIntensity * (Math.random() * 0.25 + 0.75);
 
-        addRipple(
-          x + (Math.random() - 0.5) * 2,
-          y + (Math.random() - 0.5) * 2,
-          finalIntensity
-        );
+        addRipple(x + (Math.random() - 0.5) * 2, y + (Math.random() - 0.5) * 2, finalIntensity);
 
         lastMouse.x = x;
         lastMouse.y = y;
@@ -486,7 +477,7 @@ export default function DashboardPage() {
       if (!event.touches[0]) return;
 
       const now = performance.now();
-      if (now - mouseThrottle < 10) return;
+      if (now - mouseThrottle < 12) return;
       mouseThrottle = now;
 
       const x = event.touches[0].clientX;
@@ -499,8 +490,7 @@ export default function DashboardPage() {
       if (dist > 2) {
         const v = dist / 10;
         const velocityInfluence = Math.min(v / 10, 2.0);
-        const baseIntensity = Math.min(dist / 28, 1.0);
-
+        const baseIntensity = Math.min(dist / 30, 1.0);
         const finalIntensity =
           baseIntensity * velocityInfluence * waterSettings.mouseIntensity * (Math.random() * 0.25 + 0.75);
 
@@ -527,7 +517,6 @@ export default function DashboardPage() {
     window.addEventListener("touchmove", onTouchMove, { passive: false });
     window.addEventListener("touchstart", onTouchStart, { passive: false });
 
-    // Resize
     const onResize = () => {
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
       renderer.setSize(window.innerWidth, window.innerHeight);
@@ -535,31 +524,24 @@ export default function DashboardPage() {
     };
     window.addEventListener("resize", onResize);
 
-    // Animation loop
     let rafId = 0;
-
-    // Subtle initial ripple
-    setTimeout(() => addRipple(window.innerWidth / 2, window.innerHeight / 2, 1.1), 250);
+    setTimeout(() => addRipple(window.innerWidth / 2, window.innerHeight / 2, 1.0), 220);
 
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
-      const elapsed = clock.getElapsedTime();
-      material.uniforms.u_time.value = elapsed;
-
+      material.uniforms.u_time.value = clock.getElapsedTime();
       updateWaterSimulation();
       renderer.render(scene, camera);
     };
 
     animate();
 
-    // Pause when hidden (battery)
     const onVis = () => {
       if (document.hidden) cancelAnimationFrame(rafId);
       else animate();
     };
     document.addEventListener("visibilitychange", onVis);
 
-    // Cleanup
     return () => {
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("resize", onResize);
@@ -576,21 +558,17 @@ export default function DashboardPage() {
       waterTexture.dispose();
       renderer.dispose();
 
-      if (renderer.domElement?.parentNode) {
-        renderer.domElement.parentNode.removeChild(renderer.domElement);
-      }
+      if (renderer.domElement?.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement);
     };
   }, [shaders]);
 
   // -----------------------------
-  // Upload handlers (local only)
+  // Upload helpers
   // -----------------------------
   const addFiles = (incoming: FileList | File[]) => {
     const arr = Array.from(incoming).filter(isAllowed);
 
-    const existing = new Set(
-      files.map((x) => `${x.file.name}:${x.file.size}:${x.file.lastModified}`)
-    );
+    const existing = new Set(files.map((x) => `${x.file.name}:${x.file.size}:${x.file.lastModified}`));
 
     const next: LocalFile[] = [];
     for (const f of arr) {
@@ -602,6 +580,7 @@ export default function DashboardPage() {
   };
 
   const onBrowse = () => inputRef.current?.click();
+  const onUploadMore = () => inputRef.current?.click();
 
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.length) addFiles(e.target.files);
@@ -616,56 +595,234 @@ export default function DashboardPage() {
     if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
   };
 
+  const outputLabel = (k: OutputType) =>
+    k === "study_guide" ? "Study Guide" : k === "flash_card" ? "Flash Card" : k[0].toUpperCase() + k.slice(1);
+
+  // -----------------------------
+  // Upload to backend
+  // -----------------------------
+  const uploadToBackend = async () => {
+    if (!files.length || uploading) return;
+
+    setUploading(true);
+    try {
+      const form = new FormData();
+      for (const f of files) form.append("files", f.file);
+
+      const res = await fetch("http://localhost:8000/api/upload", { method: "POST", body: form });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Upload failed");
+      }
+
+      const data = await res.json();
+      const normalized: UploadedFile[] = (data.files || []).map((f: any) => {
+        const name = f.name || f.filename || "unknown";
+        const status = f.status || "extracted";
+        const text = typeof f.text === "string" ? f.text : "";
+        return { id: crypto.randomUUID(), name, status, textLen: text.length };
+      });
+
+      const combined = (data.combined_text || "") as string;
+
+      setUploaded(normalized);
+      setCombinedTextLen(combined.length);
+
+      if (view === "upload") {
+        setView("chat");
+        setMessages([
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          title: "Hello",
+          text: `I uploaded ${normalized.length || 0} file(s). Can you help me?`,
+        },
+        {
+          id: crypto.randomUUID(),
+          role: "ai",
+          title: "Welcome",
+          meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
+          text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
+        },
+      ]);
+      setSelectedOutput(null);
+      } else {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.role === "ai" && m.title === "Welcome"
+              ? { ...m, meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel` }
+              : m
+          )
+        );
+      }
+    } finally {
+      setUploading(false);
+    }
+  };
+
   const onContinue = async () => {
-    if (!canContinue) return;
-
-    const form = new FormData();
-    for (const f of files) {
-      form.append("files", f.file); // IMPORTANT: key must match backend param name
+    try {
+      await uploadToBackend();
+    } catch (e: any) {
+      alert(`Upload failed: ${e?.message || "Unknown error"}`);
     }
+  };
 
-    const res = await fetch("http://localhost:8000/api/upload", {
-      method: "POST",
-      body: form,
-    });
+  // Auto-upload when user adds more files in chat view
+  useEffect(() => {
+    if (view !== "chat") return;
+    if (!files.length) return;
+    if (uploading) return;
 
-    if (!res.ok) {
-      const msg = await res.text();
-      alert(`Upload failed: ${msg}`);
-      return;
+    const key = files.map((f) => `${f.file.name}:${f.file.size}:${f.file.lastModified}`).join("|");
+    if (pendingUploadCount <= 0) return;
+
+    if (autoSyncLockRef.current) return;
+    if (lastAutoUploadKeyRef.current === key) return;
+
+    autoSyncLockRef.current = true;
+    lastAutoUploadKeyRef.current = key;
+
+    (async () => {
+      try {
+        await uploadToBackend();
+      } catch {
+        // ignore
+      } finally {
+        setTimeout(() => {
+          autoSyncLockRef.current = false;
+        }, 250);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files, view]);
+
+  // -----------------------------
+  // Generate output (buttons)
+  // -----------------------------
+  const onSelectOutput = async (k: OutputType) => {
+    if (generating) return;
+    setSelectedOutput(k);
+    setGenerating(true);
+
+    const userMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      text: `Make a ${outputLabel(k)} from my uploaded notes.`,
+    };
+
+    const aiLoadingId = crypto.randomUUID();
+    const aiLoading: ChatMessage = {
+      id: aiLoadingId,
+      role: "ai",
+      title: outputLabel(k),
+      text: "Generating…",
+      loading: true,
+    };
+
+    setMessages((prev) => [...prev, userMsg, aiLoading]);
+
+    try {
+      const res = await fetch("http://localhost:8000/api/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          output_type: k,
+          combined_text_len: combinedTextLen,
+          sources: uploaded.map((u) => ({ name: u.name, status: u.status, textLen: u.textLen })),
+        }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Generate failed");
+      }
+
+      const data = await res.json();
+      const answer =
+        typeof data.text === "string"
+          ? data.text
+          : typeof data.response === "string"
+          ? data.response
+          : JSON.stringify(data);
+
+      setMessages((prev) => prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m)));
+    } catch (e: any) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
+        )
+      );
+    } finally {
+      setGenerating(false);
     }
+  };
 
-    const data = await res.json();
+  // -----------------------------
+  // Chat send (always visible bar, like your screenshot)
+  // -----------------------------
+  const onSendChat = async () => {
+    const text = chatInput.trim();
+    if (!text || generating) return;
 
-    // For now: just show how much text you extracted (proof it's working)
-    const extractedCount = data.files.filter((x: any) => x.status === "extracted").length;
-    const needsOcrCount = data.files.filter((x: any) => x.status === "needs_ocr").length;
-    console.log("/api/upload response:", data);
+    setChatInput("");
+    setGenerating(true);
 
-    // canonical per-file text (best)
-    console.log(
-      "Per-file extracted text:",
-      data.files?.map((f: any) => ({
-        name: f.name,
-        status: f.status,
-        chars: (f.text || "").length,
-        preview: (f.text || "").slice(0, 300),
-      }))
-    );
+    const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", text };
 
-    // shortcut combined text (good for quick prototype)
-    console.log("Combined text preview:", (data.combined_text || "").slice(0, 1000));
-    alert(
-      `Done.\nExtracted: ${extractedCount}\nNeeds OCR: ${needsOcrCount}\nCombined text length: ${data.combined_text?.length || 0}`
-    );
+    const aiLoadingId = crypto.randomUUID();
+    const aiLoading: ChatMessage = { id: aiLoadingId, role: "ai", text: "Thinking…", loading: true };
 
-    // Next sprint: store data.combined_text in state and open chat view
+    setMessages((prev) => [...prev, userMsg, aiLoading]);
+
+    try {
+      const res = await fetch("http://localhost:8000/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          // send minimal history (no loading messages)
+          messages: messages
+            .filter((m) => !m.loading)
+            .map((m) => ({
+              role: m.role === "ai" ? "assistant" : "user",
+              content: [m.title, m.meta, m.text].filter(Boolean).join("\n"),
+            })),
+          sources: uploaded.map((u) => ({ name: u.name, status: u.status, textLen: u.textLen })),
+        }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Chat failed");
+      }
+
+      const data = await res.json();
+      const answer =
+        typeof data.text === "string"
+          ? data.text
+          : typeof data.response === "string"
+          ? data.response
+          : JSON.stringify(data);
+
+      setMessages((prev) => prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m)));
+    } catch (e: any) {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
+        )
+      );
+    } finally {
+      setGenerating(false);
+    }
   };
 
   return (
     <div className="pu-root">
       <style jsx global>{`
-        * { box-sizing: border-box; }
+        * {
+          box-sizing: border-box;
+        }
       `}</style>
 
       {/* background */}
@@ -673,12 +830,43 @@ export default function DashboardPage() {
       <div className="pu-vignette" aria-hidden="true" />
 
       <style jsx>{`
+        :global(:root) {
+          /* Black base + warm accent gradient */
+          --pu-bg: #07070b;
+          --pu-text: rgba(255, 255, 255, 0.92);
+          --pu-muted: rgba(255, 255, 255, 0.62);
+
+          --pu-accent-1: #ee0979;
+          --pu-accent-2: #ff6a00;
+
+          /* Glass on black (stronger, more premium) */
+          --pu-glass: rgba(255, 255, 255, 0.05);
+          --pu-glass-strong: rgba(255, 255, 255, 0.10);
+          --pu-border: rgba(255, 255, 255, 0.14);
+          --pu-border-soft: rgba(255, 255, 255, 0.10);
+          --pu-shadow: rgba(0, 0, 0, 0.55);
+
+          /* Typography (ChatGPT-like scale) */
+          --pu-font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+
+          --pu-fs-10: 10px;
+          --pu-fs-11: 11px;
+          --pu-fs-12: 12px;
+          --pu-fs-13: 13px;
+          --pu-fs-14: 14px;
+
+          --pu-lh-tight: 1.25;
+          --pu-lh-body: 1.55;
+        }
+
         .pu-bg {
           position: fixed;
           inset: 0;
           z-index: 0;
           background: var(--pu-bg);
         }
+
+        /* Vignette for depth */
         .pu-vignette {
           position: fixed;
           inset: 0;
@@ -696,17 +884,26 @@ export default function DashboardPage() {
           height: 100vh;
           padding: 18px;
           overflow: hidden;
+          color: var(--pu-text);
+          font-family: var(--pu-font-sans);
+          font-size: var(--pu-fs-13);
+          -webkit-font-smoothing: antialiased;
+          -moz-osx-font-smoothing: grayscale;
+          text-rendering: optimizeLegibility;
         }
+
+      
 
         .pu-shell {
           position: relative;
           z-index: 2;
           height: 100%;
           display: grid;
-          grid-template-columns: 320px 1fr;
+          grid-template-columns: 340px 1fr;
           gap: 14px;
         }
 
+        /* Sidebar */
         .pu-sidebar {
           padding: 14px;
           display: flex;
@@ -715,18 +912,18 @@ export default function DashboardPage() {
         }
 
         .pu-brand {
-          font-weight: 950;
+          font-weight: 900;
           letter-spacing: -0.02em;
           background: linear-gradient(90deg, var(--pu-accent-1), var(--pu-accent-2));
           -webkit-background-clip: text;
           background-clip: text;
           color: transparent;
-          font-size: 18px;
+          font-size: var(--pu-fs-14);
         }
 
         .pu-subtitle {
           margin-top: 6px;
-          font-size: 12px;
+          font-size: var(--pu-fs-11);
           color: var(--pu-muted);
         }
 
@@ -737,8 +934,8 @@ export default function DashboardPage() {
           gap: 10px;
           padding: 10px 12px;
           border-radius: 14px;
-          border: 1px solid var(--pu-border);
-          background: rgba(255, 255, 255, 0.06);
+          border: 1px solid rgba(255, 255, 255, 0.10);
+          background: rgba(255, 255, 255, 0.035);
         }
 
         .pu-search input {
@@ -747,7 +944,7 @@ export default function DashboardPage() {
           background: transparent;
           width: 100%;
           color: var(--pu-text);
-          font-size: 13px;
+          font-size: var(--pu-fs-12);
         }
 
         .pu-list {
@@ -755,8 +952,7 @@ export default function DashboardPage() {
           display: flex;
           flex-direction: column;
           gap: 10px;
-          overflow-y: auto;
-          overflow-x: hidden;
+          overflow: auto;
           padding-right: 6px;
         }
 
@@ -764,29 +960,30 @@ export default function DashboardPage() {
           padding: 12px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.055);
+          background: rgba(255, 255, 255, 0.035);
           cursor: pointer;
           transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
         }
 
         .pu-item:hover {
-          background: rgba(255, 255, 255, 0.075);
+          background: rgba(255, 255, 255, 0.05);
           border-color: rgba(255, 255, 255, 0.16);
           transform: translateY(-1px);
         }
 
         .pu-itemTitle {
-          font-size: 13px;
+          font-size: var(--pu-fs-12);
           font-weight: 850;
-          color: var(--pu-text);
+          color: rgba(255, 255, 255, 0.88);
         }
 
         .pu-itemSub {
           margin-top: 4px;
-          font-size: 12px;
+          font-size: var(--pu-fs-11);
           color: var(--pu-muted);
         }
 
+        /* Main */
         .pu-main {
           display: flex;
           flex-direction: column;
@@ -810,38 +1007,34 @@ export default function DashboardPage() {
           padding: 8px 10px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.04);
         }
 
         .pu-avatar {
-          width: 32px;
-          height: 32px;
+          width: 30px;
+          height: 30px;
           border-radius: 999px;
           border: 1px solid rgba(255, 255, 255, 0.14);
-          background: linear-gradient(
-            135deg,
-            rgba(238, 9, 121, 0.30),
-            rgba(255, 106, 0, 0.25)
-          );
+          background: rgba(255, 255, 255, 0.06);
           display: grid;
           place-items: center;
-          font-weight: 950;
+          font-weight: 900;
           font-size: 12px;
-          color: rgba(255, 255, 255, 0.92);
+          color: rgba(255, 255, 255, 0.9);
         }
 
         .pu-userHint {
-          font-size: 10px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.70);
+          font-size: var(--pu-fs-10);
+          font-weight: 800;
+          color: rgba(255, 255, 255, 0.60);
           text-transform: uppercase;
           line-height: 1.1;
         }
 
         .pu-userName {
-          font-size: 12px;
-          font-weight: 900;
-          color: var(--pu-text);
+          font-size: var(--pu-fs-11);
+          font-weight: 850;
+          color: rgba(255, 255, 255, 0.9);
           line-height: 1.1;
         }
 
@@ -850,7 +1043,7 @@ export default function DashboardPage() {
           height: 40px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.04);
           cursor: pointer;
           display: grid;
           place-items: center;
@@ -858,18 +1051,22 @@ export default function DashboardPage() {
         }
 
         .pu-hamburger:hover {
-          background: rgba(255, 255, 255, 0.08);
+          background: rgba(255, 255, 255, 0.06);
           border-color: rgba(255, 255, 255, 0.18);
           transform: translateY(-1px);
         }
 
-        /* Center content is empty chat + upload gate */
         .pu-content {
           flex: 1;
           min-height: 0;
-          overflow-y: auto;
-          overflow-x: hidden;
-          padding: 18px;
+          overflow: hidden; /* chat handles its own scroll */
+          padding: 14px;
+          position: relative;
+        }
+
+        /* Upload card (centered) */
+        .pu-uploadCenter {
+          height: 100%;
           display: grid;
           place-items: center;
         }
@@ -889,17 +1086,18 @@ export default function DashboardPage() {
         }
 
         .pu-h1 {
-          font-size: 18px;
-          font-weight: 950;
+          font-size: var(--pu-fs-14);
+          font-weight: 900;
           letter-spacing: -0.02em;
-          color: var(--pu-text);
+          color: rgba(255, 255, 255, 0.9);
         }
 
         .pu-desc {
           margin-top: 6px;
-          font-size: 13px;
+          font-size: var(--pu-fs-12);
           color: var(--pu-muted);
           line-height: 1.45;
+          max-width: 56ch;
         }
 
         .pu-btnRow {
@@ -912,19 +1110,16 @@ export default function DashboardPage() {
           padding: 10px 12px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-          color: var(--pu-text);
-          font-size: 12px;
-          font-weight: 900;
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.9);
+          font-size: var(--pu-fs-12);
+          font-weight: 850;
           cursor: pointer;
         }
 
         .pu-btnPrimary {
-          background: linear-gradient(
-            90deg,
-            rgba(238, 9, 121, 0.22),
-            rgba(255, 106, 0, 0.22)
-          );
+          background: rgba(255, 255, 255, 0.07);
+          border-color: rgba(255, 255, 255, 0.16);
         }
 
         .pu-btnDisabled {
@@ -935,15 +1130,15 @@ export default function DashboardPage() {
         .pu-drop {
           margin-top: 12px;
           border-radius: 16px;
-          border: 1px dashed rgba(255, 255, 255, 0.18);
-          background: rgba(255, 255, 255, 0.05);
+          border: 1px dashed rgba(255, 255, 255, 0.16);
+          background: rgba(255, 255, 255, 0.03);
           padding: 18px;
           transition: background 120ms ease, border-color 120ms ease;
         }
 
         .pu-drop.drag {
-          background: rgba(255, 255, 255, 0.075);
-          border-color: rgba(255, 255, 255, 0.28);
+          background: rgba(255, 255, 255, 0.05);
+          border-color: rgba(255, 255, 255, 0.24);
         }
 
         .pu-dropInner {
@@ -954,19 +1149,15 @@ export default function DashboardPage() {
           flex-wrap: wrap;
         }
 
-        .pu-dropLeft {
-          min-width: 240px;
-        }
-
         .pu-dropTitle {
-          font-weight: 900;
-          font-size: 14px;
-          color: var(--pu-text);
+          font-weight: 850;
+          font-size: var(--pu-fs-13);
+          color: rgba(255, 255, 255, 0.88);
         }
 
         .pu-dropSub {
           margin-top: 6px;
-          font-size: 12px;
+          font-size: var(--pu-fs-11);
           color: var(--pu-muted);
         }
 
@@ -987,18 +1178,14 @@ export default function DashboardPage() {
           gap: 12px;
           padding: 12px;
           border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
-        }
-
-        .pu-fileMeta {
-          min-width: 0;
+          border: 1px solid rgba(255, 255, 255, 0.10);
+          background: rgba(255, 255, 255, 0.035);
         }
 
         .pu-fileName {
-          font-size: 13px;
-          font-weight: 900;
-          color: var(--pu-text);
+          font-size: var(--pu-fs-12);
+          font-weight: 850;
+          color: rgba(255, 255, 255, 0.88);
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
@@ -1007,7 +1194,7 @@ export default function DashboardPage() {
 
         .pu-fileSize {
           margin-top: 4px;
-          font-size: 12px;
+          font-size: var(--pu-fs-11);
           color: var(--pu-muted);
         }
 
@@ -1016,12 +1203,277 @@ export default function DashboardPage() {
           height: 40px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.04);
           cursor: pointer;
           display: grid;
           place-items: center;
           color: rgba(255, 255, 255, 0.9);
           font-weight: 900;
+        }
+
+        /* Chat layout to match screenshot */
+        /* Chat layout (clean, launch-worthy) */
+        .pu-chatCanvas {
+          height: 100%;
+          display: grid;
+          grid-template-rows: 1fr auto;
+          gap: 10px;
+          min-height: 0;
+        }
+
+        .pu-chatTop {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 10px 12px;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.10);
+          background: rgba(255, 255, 255, 0.03);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+        }
+
+        .pu-chatTitle {
+          font-size: 12px;
+          font-weight: 900;
+          color: rgba(255, 255, 255, 0.90);
+          letter-spacing: -0.01em;
+        }
+
+        .pu-chatSub {
+          margin-top: 4px;
+          font-size: 11px;
+          color: var(--pu-muted);
+        }
+
+        .pu-chatTopRight {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }
+
+        .pu-outputPickerInFeed {
+          width: min(620px, 86%);
+          padding: 14px;
+          border-radius: 16px;
+        }
+
+        .pu-outputRow {
+          margin-top: 12px;
+          display: flex;
+          gap: 10px;
+          justify-content: flex-start;
+          flex-wrap: wrap;
+        }
+
+        .pu-pickerTitle {
+          font-size: var(--pu-fs-13);
+          font-weight: 900;
+          color: rgba(255, 255, 255, 0.92);
+          line-height: var(--pu-lh-tight);
+        }
+
+        .pu-pickerSub {
+          margin-top: 6px;
+          font-size: var(--pu-fs-11);
+          color: var(--pu-muted);
+        }
+
+        .pu-chatScroll {
+          min-height: 0;
+          overflow: auto;
+          padding: 12px 10px 24px 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+        }
+
+        .pu-msgRow {
+          display: flex;
+        }
+
+        .pu-msgRow.left {
+          justify-content: flex-start;
+        }
+
+        .pu-msgRow.right {
+          justify-content: flex-end;
+        }
+
+        .pu-msgBubble {
+          width: fit-content;
+          max-width: min(720px, 86%);
+          border-radius: 16px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.04);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          padding: 12px 14px;
+          box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
+        }
+
+        .pu-msgBubble.user {
+          background: rgba(255, 255, 255, 0.035);
+          border-color: rgba(255, 255, 255, 0.10);
+        }
+
+        .pu-msgBubble.ai {
+          background: rgba(255, 255, 255, 0.05);
+          border-color: rgba(255, 255, 255, 0.14);
+        }
+
+        .pu-msgTitle {
+          font-size: var(--pu-fs-12);
+          font-weight: 900;
+          color: rgba(255, 255, 255, 0.90);
+          letter-spacing: -0.01em;
+          line-height: var(--pu-lh-tight);
+        }
+
+        .pu-msgMeta {
+          margin-top: 6px;
+          font-size: var(--pu-fs-11);
+          color: rgba(255, 255, 255, 0.62);
+        }
+
+        .pu-msgText {
+          margin-top: 8px;
+          font-size: var(--pu-fs-13);
+          color: rgba(255, 255, 255, 0.80);
+          line-height: var(--pu-lh-body);
+          white-space: pre-wrap;
+        }
+
+        .pu-msgText.loading {
+          color: rgba(255, 255, 255, 0.70);
+        }
+
+
+        .pu-attach {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 10px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.88);
+          font-size: var(--pu-fs-12);
+          font-weight: 850;
+          cursor: pointer;
+          white-space: nowrap;
+          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+        }
+
+        .pu-attach:hover {
+          background: rgba(255, 255, 255, 0.06);
+          border-color: rgba(255, 255, 255, 0.18);
+          transform: translateY(-1px);
+        }
+
+        .pu-attachText {
+          color: rgba(255, 255, 255, 0.72);
+        }
+
+        
+
+        .pu-miniBtn {
+          padding: 8px 10px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.88);
+          font-size: 11px;
+          font-weight: 850;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+
+        .pu-pill {
+          font-size: var(--pu-fs-11);
+          color: rgba(255, 255, 255, 0.62);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.03);
+          padding: 6px 10px;
+          border-radius: 999px;
+        }
+
+        /* output pills under the question bubble, centered-ish */
+        .pu-outputRow {
+          margin-top: 12px;
+          display: flex;
+          gap: 10px;
+          justify-content: center;
+          flex-wrap: wrap;
+        }
+
+        .pu-outputBtn {
+          padding: 9px 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.88);
+          font-size: var(--pu-fs-12);
+          font-weight: 900;
+          cursor: pointer;
+          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+        }
+
+        .pu-outputBtn:hover {
+          background: rgba(255, 255, 255, 0.06);
+          border-color: rgba(255, 255, 255, 0.20);
+          transform: translateY(-1px);
+        }
+
+        .pu-outputBtn:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
+        }
+
+        /* Bottom chat bar like screenshot */
+        .pu-chatBarWrap {
+          padding: 8px 6px 10px 6px;
+        }
+
+        .pu-chatBar {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 10px 12px;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.04);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+        }
+
+        .pu-chatInput {
+          flex: 1;
+          border: none;
+          outline: none;
+          background: transparent;
+          color: rgba(255, 255, 255, 0.9);
+          font-size: var(--pu-fs-13);
+        }
+
+        .pu-send {
+          width: 40px;
+          height: 40px;
+          border-radius: 12px;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          background: rgba(255, 255, 255, 0.06);
+          cursor: pointer;
+          display: grid;
+          place-items: center;
+        }
+
+        .pu-send:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
         }
 
         /* Drawer */
@@ -1067,28 +1519,28 @@ export default function DashboardPage() {
         }
 
         .pu-h2 {
-          font-size: 14px;
-          font-weight: 950;
-          color: var(--pu-text);
+          font-size: 13px;
+          font-weight: 900;
+          color: rgba(255, 255, 255, 0.9);
         }
 
         .pu-card {
           padding: 12px;
           border-radius: 14px;
           border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.045);
         }
 
         .pu-cardTitle {
-          font-size: 13px;
+          font-size: 12px;
           font-weight: 900;
-          color: var(--pu-text);
+          color: rgba(255, 255, 255, 0.9);
         }
 
         .pu-cardSub {
           margin-top: 6px;
-          font-size: 12px;
-          color: rgba(255, 255, 255, 0.70);
+          font-size: 11px;
+          color: rgba(255, 255, 255, 0.64);
           line-height: 1.45;
         }
 
@@ -1111,19 +1563,21 @@ export default function DashboardPage() {
             <SearchIcon />
             <input placeholder="Search projects…" />
           </div>
+
           <div className="pu-list">
-            <div className="pu-item">
-              <div className="pu-itemTitle">Software Dev StudyGuide</div>
-              <div className="pu-itemSub">Last opened • Today</div>
-            </div>
-            <div className="pu-item">
-              <div className="pu-itemTitle">Compiler Designing</div>
-              <div className="pu-itemSub">Last opened • Yesterday</div>
-            </div>
-            <div className="pu-item">
-              <div className="pu-itemTitle">AI Midterm Notes</div>
-              <div className="pu-itemSub">Last opened • 2 days ago</div>
-            </div>
+            {[
+              ["Software Development StudyGuide", "Today"],
+              ["Compiler Designing", "Yesterday"],
+              ["AI Study Guide Midterm", "2 days ago"],
+              ["Automated Theory Finals", "4 days ago"],
+              ["Mobile Computing Design", "1 week ago"],
+              ["Wireless Network Study Guide", "2 weeks ago"],
+            ].map(([title, sub]) => (
+              <div key={title} className="pu-item">
+                <div className="pu-itemTitle">{title}</div>
+                <div className="pu-itemSub">Last opened • {sub}</div>
+              </div>
+            ))}
           </div>
         </aside>
 
@@ -1141,6 +1595,7 @@ export default function DashboardPage() {
               <HamburgerIcon />
             </button>
           </div>
+
           <div
             className="pu-content"
             onDragEnter={(e) => {
@@ -1157,75 +1612,182 @@ export default function DashboardPage() {
             }}
             onDrop={onDrop}
           >
-            <div className="pu-glass pu-uploadCard">
-              <div className="pu-titleRow">
-                <div>
-                  <div className="pu-h1">Upload your notes</div>
-                  <div className="pu-desc">
-                    Add PDFs, docs, slides, images, audio/video, code, archives — anything. Next step will be chat + generation options.
-                  </div>
-                </div>
-                <div className="pu-btnRow">
-                  <button className="pu-btn" onClick={onBrowse} type="button">
-                    Browse
-                  </button>
-                  <button
-                    className={`pu-btn pu-btnPrimary ${!canContinue ? "pu-btnDisabled" : ""}`}
-                    onClick={onContinue}
-                    disabled={!canContinue}
-                    type="button"
-                  >
-                    Continue
-                  </button>
-                </div>
-              </div>
-              <div className={`pu-drop${dragging ? " drag" : ""}`}>
-                <div className="pu-dropInner">
-                  <div className="pu-dropLeft">
-                    <div className="pu-dropTitle">Drag & drop files here</div>
-                    <div className="pu-dropSub">
-                      Supported: most file types (PDF/DOCX/PPTX/IMG/AUDIO/VIDEO/etc.) • No storage yet (local only)
-                    </div>
-                  </div>
-                  <div className="pu-btnRow">
-                    <button className="pu-btn" onClick={onBrowse} type="button">
-                      Select files
-                    </button>
-                  </div>
-                </div>
-              </div>
-              <input
-                ref={inputRef}
-                type="file"
-                multiple
-                hidden
-                onChange={onInputChange}
-                accept="*/*"
-              />
-              {files.length > 0 ? (
-                <div className="pu-fileList" aria-label="Selected files">
-                  {files.map((f) => (
-                    <div key={f.id} className="pu-fileItem">
-                      <div className="pu-fileMeta">
-                        <div className="pu-fileName">{f.file.name}</div>
-                        <div className="pu-fileSize">{formatBytes(f.file.size)}</div>
+            {view === "upload" ? (
+              <div className="pu-uploadCenter">
+                <div className="pu-glass pu-uploadCard">
+                  <div className="pu-titleRow">
+                    <div>
+                      <div className="pu-h1">Upload your notes</div>
+                      <div className="pu-desc">
+                        Add PDFs, docs, slides, images, audio/video, code, archives — anything. Next step will be chat +
+                        generation options.
                       </div>
-                      <button className="pu-remove" onClick={() => removeFile(f.id)} aria-label="Remove file">
-                        ✕
+                    </div>
+                    <div className="pu-btnRow">
+                      <button className="pu-btn" onClick={onBrowse} type="button">
+                        Browse
+                      </button>
+                      <button
+                        className={`pu-btn pu-btnPrimary ${!canContinue ? "pu-btnDisabled" : ""}`}
+                        onClick={onContinue}
+                        disabled={!canContinue}
+                        type="button"
+                      >
+                        {uploading ? "Uploading…" : "Continue"}
                       </button>
                     </div>
-                  ))}
+                  </div>
+
+                  <div className={`pu-drop${dragging ? " drag" : ""}`}>
+                    <div className="pu-dropInner">
+                      <div>
+                        <div className="pu-dropTitle">Drag & drop files here</div>
+                        <div className="pu-dropSub">Supported: most file types • Local selection</div>
+                      </div>
+                      <div className="pu-btnRow">
+                        <button className="pu-btn" onClick={onBrowse} type="button">
+                          Select files
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <input ref={inputRef} type="file" multiple hidden onChange={onInputChange} accept="*/*" />
+
+                  {files.length > 0 ? (
+                    <div className="pu-fileList" aria-label="Selected files">
+                      {files.map((f) => (
+                        <div key={f.id} className="pu-fileItem">
+                          <div>
+                            <div className="pu-fileName">{f.file.name}</div>
+                            <div className="pu-fileSize">{formatBytes(f.file.size)}</div>
+                          </div>
+                          <button className="pu-remove" onClick={() => removeFile(f.id)} aria-label="Remove file">
+                            ✕
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
-              ) : null}
+              </div>
+            ) : (
+              <div className="pu-chatCanvas">
+              {/* Top bar */}
+              {/* <div className="pu-chatTop">
+                <div className="pu-chatTopLeft">
+                  <div className="pu-chatTitle">Dashboard</div>
+                  <div className="pu-chatSub">
+                    Sources: {uploaded.length || 0} file(s) • {channelsCount} channel
+                    {uploading ? " • Uploading…" : ""}
+                    {!uploading && pendingUploadCount > 0 ? ` • Pending: ${pendingUploadCount}` : ""}
+                  </div>
+                </div>
+
+                <div className="pu-chatTopRight">
+                  <button className="pu-miniBtn" onClick={onUploadMore} type="button">
+                    + Upload more
+                  </button>
+                  {selectedOutput ? (
+                    <span className="pu-pill">Selected: {outputLabel(selectedOutput)}</span>
+                  ) : (
+                    <span className="pu-pill">Pick an output to start</span>
+                  )}
+                </div>
+              </div> */}
+
+              {/* Chat feed */}
+              <div ref={chatListRef} className="pu-chatScroll">
+                {messages.map((m) => (
+                  <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "left" : "right"}`}>
+                    <div className={`pu-msgBubble ${m.role === "user" ? "user" : "ai"}`}>
+                      {m.title ? <div className="pu-msgTitle">{m.title}</div> : null}
+                      {m.meta ? <div className="pu-msgMeta">{m.meta}</div> : null}
+                      <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
+                    </div>
+                  </div>
+                ))}
+
+                {!selectedOutput ? (
+                  <div className="pu-msgRow right">
+                    <div className="pu-outputPickerInFeed pu-glass">
+                      <div className="pu-pickerTitle">What should I make from your notes?</div>
+                      <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
+                      <div className="pu-outputRow">
+                        {(
+                          [
+                            ["podcast", "Podcast"],
+                            ["study_guide", "Study Guide"],
+                            ["narrative", "Narrative"],
+                            ["flash_card", "Flash Card"],
+                          ] as Array<[OutputType, string]>
+                        ).map(([key, label]) => (
+                          <button
+                            key={key}
+                            type="button"
+                            className="pu-outputBtn"
+                            onClick={() => onSelectOutput(key)}
+                            disabled={generating || uploading}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* Bottom bar */}
+              <div className="pu-chatBarWrap">
+                <div className="pu-chatBar">
+                  <button className="pu-attach" type="button" onClick={onUploadMore}>
+                  <PaperclipIcon />
+                  <span className="pu-attachText">
+                    {uploaded.length || 0} file(s)
+                    {uploading ? " • uploading…" : ""}
+                    {!uploading && pendingUploadCount > 0 ? ` • pending: ${pendingUploadCount}` : ""}
+                  </span>
+                </button>
+
+                
+                  <input
+                    className="pu-chatInput"
+                    placeholder={
+                      selectedOutput
+                        ? "Ask for changes, add sections, shorten, format, etc…"
+                        : "Pick Podcast / Study Guide / Narrative / Flash Card to start…"
+                    }
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        onSendChat();
+                      }
+                    }}
+                    disabled={!selectedOutput}
+                  />
+                  <button
+                    className="pu-send"
+                    onClick={onSendChat}
+                    disabled={generating || !chatInput.trim() || !selectedOutput}
+                    aria-label="Send"
+                  >
+                    <SendIcon />
+                  </button>
+                </div>
+              </div>
+
+              <input ref={inputRef} type="file" multiple hidden onChange={onInputChange} accept="*/*" />
             </div>
+            )}
           </div>
         </main>
       </div>
 
       {/* Drawer overlay */}
-      {drawerOpen ? (
-        <div className="pu-overlay" aria-hidden="true" onClick={() => setDrawerOpen(false)} />
-      ) : null}
+      {drawerOpen ? <div className="pu-overlay" aria-hidden="true" onClick={() => setDrawerOpen(false)} /> : null}
 
       {/* Right drawer */}
       <aside className={`pu-drawer ${drawerOpen ? "open" : ""}`} aria-hidden={!drawerOpen}>
@@ -1239,12 +1801,12 @@ export default function DashboardPage() {
 
           <div className="pu-card">
             <div className="pu-cardTitle">Upload</div>
-            <div className="pu-cardSub">Add any files. Next: extract content + chat.</div>
+            <div className="pu-cardSub">Add files. In chat, uploads auto-sync immediately.</div>
           </div>
 
           <div className="pu-card">
             <div className="pu-cardTitle">Generate</div>
-            <div className="pu-cardSub">Podcast, study guide, flashcards, quizzes (next sprint).</div>
+            <div className="pu-cardSub">Pick Podcast / Study Guide / Narrative / Flash Cards.</div>
           </div>
 
           <div style={{ flex: 1 }} />
@@ -1272,16 +1834,39 @@ function HamburgerIcon() {
 function SearchIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M10.5 18.5a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z"
-        stroke="rgba(255,255,255,0.55)"
-        strokeWidth="2"
-      />
+      <path d="M10.5 18.5a8 8 0 1 1 0-16 8 8 0 0 1 0 16Z" stroke="rgba(255,255,255,0.55)" strokeWidth="2" />
       <path
         d="M16.5 16.5 21 21"
         stroke="rgba(255,255,255,0.55)"
         strokeWidth="2"
         strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M4 12l16-8-7 16-2-7-7-1Z"
+        stroke="rgba(255,255,255,0.92)"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PaperclipIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M21 12.5 12.9 20.6a6 6 0 0 1-8.5-8.5l9.2-9.2a4.5 4.5 0 0 1 6.4 6.4l-9.4 9.4a3 3 0 0 1-4.2-4.2l8.7-8.7"
+        stroke="rgba(255,255,255,0.72)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
       />
     </svg>
   );
