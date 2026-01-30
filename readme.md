@@ -58,7 +58,7 @@ This will:
 - Start FastAPI backend at **http://localhost:8000**
 - Start Next.js frontend at **http://localhost:3000**
 
----
+--- 
 
 ## Daily Development Commands
 
