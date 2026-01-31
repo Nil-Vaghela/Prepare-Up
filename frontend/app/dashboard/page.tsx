@@ -57,6 +57,8 @@ export default function DashboardPage() {
   const [uploaded, setUploaded] = useState<UploadedFile[]>([]);
   const [channelsCount] = useState(1);
   const [combinedTextLen, setCombinedTextLen] = useState<number>(0);
+  // Backend session id for new API shape
+  const [sessionId, setSessionId] = useState<string | null>(null);
 
   // Status
   const [uploading, setUploading] = useState(false);
@@ -616,36 +618,65 @@ export default function DashboardPage() {
       }
 
       const data = await res.json();
+
+      // Support both backend response shapes:
+      // Old: { files, combined_text, combined_len }
+      // New: { session_id, files, preview, preview_len, ttl_seconds }
+      const sid = typeof data.session_id === "string" ? data.session_id : null;
+      if (sid) setSessionId(sid);
+
       const normalized: UploadedFile[] = (data.files || []).map((f: any) => {
         const name = f.name || f.filename || "unknown";
         const status = f.status || "extracted";
-        const text = typeof f.text === "string" ? f.text : "";
-        return { id: crypto.randomUUID(), name, status, textLen: text.length };
+
+        // Prefer server-provided lengths if present
+        const textLen =
+          typeof f.text_len === "number"
+            ? f.text_len
+            : typeof f.textLen === "number"
+            ? f.textLen
+            : typeof f.text === "string"
+            ? f.text.length
+            : 0;
+
+        return { id: crypto.randomUUID(), name, status, textLen };
       });
 
-      const combined = (data.combined_text || "") as string;
+      // Prefer server-provided combined length; fallback to combined_text length; fallback to preview length
+      const combinedLen =
+        typeof data.combined_len === "number"
+          ? data.combined_len
+          : typeof data.combinedLen === "number"
+          ? data.combinedLen
+          : typeof data.combined_text === "string"
+          ? data.combined_text.length
+          : typeof data.preview_len === "number"
+          ? data.preview_len
+          : typeof data.preview === "string"
+          ? data.preview.length
+          : 0;
 
       setUploaded(normalized);
-      setCombinedTextLen(combined.length);
+      setCombinedTextLen(combinedLen);
 
       if (view === "upload") {
         setView("chat");
         setMessages([
-        {
-          id: crypto.randomUUID(),
-          role: "user",
-          title: "Hello",
-          text: `I uploaded ${normalized.length || 0} file(s). Can you help me?`,
-        },
-        {
-          id: crypto.randomUUID(),
-          role: "ai",
-          title: "Welcome",
-          meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
-          text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
-        },
-      ]);
-      setSelectedOutput(null);
+          {
+            id: crypto.randomUUID(),
+            role: "user",
+            title: "Hello",
+            text: `I uploaded ${normalized.length || 0} file(s). Can you help me?`,
+          },
+          {
+            id: crypto.randomUUID(),
+            role: "ai",
+            title: "Welcome",
+            meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
+            text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
+          },
+        ]);
+        setSelectedOutput(null);
       } else {
         setMessages((prev) =>
           prev.map((m) =>
@@ -702,6 +733,10 @@ export default function DashboardPage() {
   // -----------------------------
   const onSelectOutput = async (k: OutputType) => {
     if (generating) return;
+    if (!sessionId) {
+      alert("Upload is not ready yet. Please upload files first.");
+      return;
+    }
     setSelectedOutput(k);
     setGenerating(true);
 
@@ -727,9 +762,8 @@ export default function DashboardPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          session_id: sessionId,
           output_type: k,
-          combined_text_len: combinedTextLen,
-          sources: uploaded.map((u) => ({ name: u.name, status: u.status, textLen: u.textLen })),
         }),
       });
 
@@ -742,6 +776,14 @@ export default function DashboardPage() {
       const answer =
         typeof data.text === "string"
           ? data.text
+          : Array.isArray(data.cards)
+          ? data.cards
+              .map((c: any, i: number) => {
+                const front = typeof c?.front === "string" ? c.front : "";
+                const back = typeof c?.back === "string" ? c.back : "";
+                return `${i + 1}. ${front}\n   - ${back}`;
+              })
+              .join("\n\n")
           : typeof data.response === "string"
           ? data.response
           : JSON.stringify(data);
@@ -764,6 +806,10 @@ export default function DashboardPage() {
   const onSendChat = async () => {
     const text = chatInput.trim();
     if (!text || generating) return;
+    if (!sessionId) {
+      alert("Upload is not ready yet. Please upload files first.");
+      return;
+    }
 
     setChatInput("");
     setGenerating(true);
@@ -780,15 +826,15 @@ export default function DashboardPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          session_id: sessionId,
           message: text,
-          // send minimal history (no loading messages)
-          messages: messages
+          history: messages
             .filter((m) => !m.loading)
+            .slice(-12)
             .map((m) => ({
-              role: m.role === "ai" ? "assistant" : "user",
+              role: m.role, // "user" | "ai" (matches backend)
               content: [m.title, m.meta, m.text].filter(Boolean).join("\n"),
             })),
-          sources: uploaded.map((u) => ({ name: u.name, status: u.status, textLen: u.textLen })),
         }),
       });
 
@@ -799,7 +845,9 @@ export default function DashboardPage() {
 
       const data = await res.json();
       const answer =
-        typeof data.text === "string"
+        typeof data.answer === "string"
+          ? data.answer
+          : typeof data.text === "string"
           ? data.text
           : typeof data.response === "string"
           ? data.response
@@ -1699,7 +1747,7 @@ export default function DashboardPage() {
               {/* Chat feed */}
               <div ref={chatListRef} className="pu-chatScroll">
                 {messages.map((m) => (
-                  <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "left" : "right"}`}>
+                  <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "right" : "left"}`}>
                     <div className={`pu-msgBubble ${m.role === "user" ? "user" : "ai"}`}>
                       {m.title ? <div className="pu-msgTitle">{m.title}</div> : null}
                       {m.meta ? <div className="pu-msgMeta">{m.meta}</div> : null}

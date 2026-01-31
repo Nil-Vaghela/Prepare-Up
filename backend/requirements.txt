@@ -11,3 +11,4 @@ pypdf
 python-docx
 python-pptx
 pydantic_settings
+openai
