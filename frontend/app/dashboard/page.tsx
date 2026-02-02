@@ -1311,7 +1311,8 @@ export default function DashboardPage() {
         .pu-outputPickerInFeed {
           width: min(620px, 86%);
           padding: 14px;
-          border-radius: 16px;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          background: rgba(255, 255, 255, 0.018);
         }
 
         .pu-outputRow {
@@ -1342,6 +1343,7 @@ export default function DashboardPage() {
           display: flex;
           flex-direction: column;
           gap: 10px;
+          
         }
 
         .pu-msgRow {
@@ -1359,44 +1361,47 @@ export default function DashboardPage() {
         .pu-msgBubble {
           width: fit-content;
           max-width: min(720px, 86%);
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
+          border-radius: 18px;
+          border: 1px solid rgba(255, 255, 255, 0.10);
+          background: rgba(0, 0, 0, 0.28);
           backdrop-filter: blur(12px);
           -webkit-backdrop-filter: blur(12px);
-          padding: 12px 14px;
-          box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28);
+          padding: 14px 16px;
+          box-shadow: 0 10px 22px rgba(0, 0, 0, 0.22);
         }
 
         .pu-msgBubble.user {
-          background: rgba(255, 255, 255, 0.035);
+          background: rgba(0, 0, 0, 0.26);
           border-color: rgba(255, 255, 255, 0.10);
         }
 
         .pu-msgBubble.ai {
-          background: rgba(255, 255, 255, 0.05);
+          background: rgba(0, 0, 0, 0.32);
           border-color: rgba(255, 255, 255, 0.14);
         }
 
         .pu-msgTitle {
-          font-size: var(--pu-fs-12);
+          font-size: 13px;
           font-weight: 900;
           color: rgba(255, 255, 255, 0.90);
           letter-spacing: -0.01em;
           line-height: var(--pu-lh-tight);
+          margin-bottom: 2px;
         }
 
         .pu-msgMeta {
           margin-top: 6px;
-          font-size: var(--pu-fs-11);
+          font-size: 12px;
+          letter-spacing: 0.01em;
           color: rgba(255, 255, 255, 0.62);
         }
 
         .pu-msgText {
           margin-top: 8px;
-          font-size: var(--pu-fs-13);
-          color: rgba(255, 255, 255, 0.80);
-          line-height: var(--pu-lh-body);
+          font-size: 14px;
+          color: rgba(255, 255, 255, 0.86);
+          line-height: 1.65;
+          text-shadow: 0 1px 0 rgba(0, 0, 0, 0.35);
           white-space: pre-wrap;
         }
 
@@ -2073,7 +2078,7 @@ export default function DashboardPage() {
 
                 {!selectedOutput ? (
                   <div className="pu-msgRow right">
-                    <div className="pu-outputPickerInFeed pu-glass">
+                    <div className="pu-outputPickerInFeed">
                       <div className="pu-pickerTitle">What should I make from your notes?</div>
                       <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
                       <div className="pu-outputRow">
