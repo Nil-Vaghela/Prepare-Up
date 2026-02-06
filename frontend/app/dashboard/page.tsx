@@ -38,12 +38,45 @@ function isAllowed(file: File) {
 }
 
 export default function DashboardPage() {
-  // Right drawer
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [drawerActive, setDrawerActive] = useState<
-    "flash_cards" | "podcast" | "saved_chats" | "mock_test" | "study_guide"
-  >("flash_cards");
+  // Sidebar reflects the current page (chat). Feature items below trigger output selection.
+  const [sidebarActive, setSidebarActive] = useState<
+    "chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide"
+  >("chat");
+  const onSidebarSelect = (key: "chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
+    // Always keep the user in the current chat screen; sidebar is not a router.
+    if (view !== "chat") setView("chat");
 
+    if (key === "chat") {
+      setSidebarActive("chat");
+      return;
+    }
+
+    // Map sidebar items to output selections
+    if (key === "flash_cards") {
+      setSidebarActive("chat");
+      setSelectedOutput("flash_card");
+      return;
+    }
+
+    if (key === "podcast") {
+      setSidebarActive("chat");
+      setSelectedOutput("podcast");
+      return;
+    }
+
+    if (key === "study_guide") {
+      setSidebarActive("chat");
+      setSelectedOutput("study_guide");
+      return;
+    }
+
+    // mock_test not implemented yet
+    if (key === "mock_test") {
+      setSidebarActive("chat");
+      alert("Mock Test is coming soon. For now, use Study Guide or Flash Cards.");
+      return;
+    }
+  };
 
   // Background mount
   const bgMountRef = useRef<HTMLDivElement | null>(null);
@@ -72,6 +105,56 @@ export default function DashboardPage() {
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
+  // Sidebar recents (premium + infinite scroll mock)
+  const [recentQuery, setRecentQuery] = useState("");
+  const [recentVisible, setRecentVisible] = useState(12);
+
+  const [recentChats, setRecentChats] = useState<Array<{ id: string; title: string; sub: string }>>(() => {
+    const base: Array<[string, string]> = [
+      ["NCR interview prep", "Today"],
+      ["ECON practice set", "Yesterday"],
+      ["Prepare-Up Sprint 1", "2 days ago"],
+      ["Database ERD notes", "4 days ago"],
+      ["LeetCode - graphs", "1 week ago"],
+      ["ML project ideas", "2 weeks ago"],
+    ];
+    const extra: Array<[string, string]> = Array.from({ length: 20 }).map((_, i) => [
+      `Chat ${i + 1 + base.length}`,
+      i < 10 ? "This month" : "Older",
+    ]);
+    const all = [...base, ...extra];
+    return all.map(([title, sub]) => ({ id: crypto.randomUUID(), title, sub }));
+  });
+
+  const filteredRecents = useMemo(() => {
+    const q = recentQuery.trim().toLowerCase();
+    if (!q) return recentChats;
+    return recentChats.filter((c) => c.title.toLowerCase().includes(q));
+  }, [recentQuery, recentChats]);
+
+  const visibleRecents = useMemo(() => filteredRecents.slice(0, recentVisible), [filteredRecents, recentVisible]);
+
+  const onRecentsScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
+    if (!nearBottom) return;
+
+    setRecentVisible((v) => Math.min(v + 10, filteredRecents.length));
+
+    // If user reached end and still scrolling (and no search), append more mock items
+    if (recentVisible >= filteredRecents.length && recentQuery.trim() === "") {
+      setRecentChats((prev) => {
+        const more = Array.from({ length: 20 }).map((_, i) => ({
+          id: crypto.randomUUID(),
+          title: `Chat ${prev.length + i + 1}`,
+          sub: "Older",
+        }));
+        return [...prev, ...more];
+      });
+    }
+  };
+
+  const onShowAllRecents = () => setRecentVisible((v) => Math.max(v, 200));
 
   const canContinue = files.length > 0 && !uploading;
 
@@ -90,25 +173,6 @@ export default function DashboardPage() {
       document.body.style.overflow = prev;
     };
   }, []);
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDrawerOpen(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-
-  useEffect(() => {
-    if (!drawerOpen) return;
-    const onMouseDown = (e: MouseEvent) => {
-      const t = e.target as Node;
-      const panel = document.querySelector(".pu-drawerPanel");
-      if (panel && !panel.contains(t)) setDrawerOpen(false);
-    };
-    document.addEventListener("mousedown", onMouseDown);
-    return () => document.removeEventListener("mousedown", onMouseDown);
-  }, [drawerOpen]);
 
   useEffect(() => {
     const el = chatListRef.current;
@@ -1006,9 +1070,51 @@ export default function DashboardPage() {
           flex-direction: column;
           gap: 10px;
           overflow: auto;
+          position: relative;
+          scrollbar-gutter: stable;
           padding-right: 6px;
         }
+          .pu-list::after {
+          content: "";
+          position: sticky;
+          bottom: 0;
+          display: block;
+          height: 34px;
+          pointer-events: none;
+          background: linear-gradient(180deg, rgba(0,0,0,0), rgba(0,0,0,0.55));
+          border-radius: 14px;
+        }
+        .pu-itemCompact {
+          padding: 10px 12px;
+          border-radius: 14px;
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.018);
+        }
 
+        .pu-itemCompact:hover {
+          background: rgba(255, 255, 255, 0.04);
+          border-color: rgba(255, 255, 255, 0.14);
+        }
+
+        .pu-showAll {
+          margin-top: 6px;
+          width: 100%;
+          padding: 10px 12px;
+          border-radius: 14px;
+          border: 1px dashed rgba(255, 255, 255, 0.14);
+          background: rgba(255, 255, 255, 0.02);
+          color: rgba(255, 255, 255, 0.78);
+          font-size: 12px;
+          font-weight: 850;
+          cursor: pointer;
+          transition: transform 160ms ease, background 160ms ease, border-color 160ms ease;
+        }
+
+        .pu-showAll:hover {
+          background: rgba(255, 255, 255, 0.04);
+          border-color: rgba(95, 227, 255, 0.22);
+          transform: translateY(-1px);
+        }
         .pu-item {
           padding: 12px;
           border-radius: 14px;
@@ -1048,7 +1154,7 @@ export default function DashboardPage() {
           padding: 12px 14px 10px 14px;
           display: flex;
           align-items: center;
-          justify-content: flex-end;
+          justify-content: space-between;
           gap: 12px;
           border-bottom: 1px solid rgba(255, 255, 255, 0.06);
         }
@@ -1091,23 +1197,7 @@ export default function DashboardPage() {
           line-height: 1.1;
         }
 
-        .pu-hamburger {
-          width: 40px;
-          height: 40px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
-          cursor: pointer;
-          display: grid;
-          place-items: center;
-          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-        }
-
-        .pu-hamburger:hover {
-          background: rgba(255, 255, 255, 0.06);
-          border-color: rgba(255, 255, 255, 0.18);
-          transform: translateY(-1px);
-        }
+      
 
         .pu-content {
           flex: 1;
@@ -1534,272 +1624,67 @@ export default function DashboardPage() {
           cursor: not-allowed;
         }
 
-        /* Drawer */
-        .pu-overlay {
-          position: fixed;
-          inset: 0;
-          z-index: 50;
-          background: rgba(0, 0, 0, 0.55);
-          backdrop-filter: blur(2px);
-          -webkit-backdrop-filter: blur(2px);
-        }
-
-        .pu-drawer {
-          position: fixed;
-          top: 0;
-          right: 0;
-          height: 100vh;
-          width: 380px;
-          max-width: 92vw;
-          z-index: 60;
-          transform: translateX(100%);
-          transition: transform 720ms cubic-bezier(0.22, 1, 0.36, 1);
-          padding: 16px;
-        }
-
-        .pu-drawer.open {
-          transform: translateX(0);
-          animation: puDrawerPop 900ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-
-        @keyframes puDrawerPop {
-          0%   { transform: translateX(104%) scale(0.985); }
-          60%  { transform: translateX(0) scale(1.008); }
-          100% { transform: translateX(0) scale(1.0); }
-        }
-
-        .pu-drawerPanel {
-          height: 100%;
-          padding: 14px;
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-          position: relative;
-          overflow: hidden;
-          isolation: isolate;
-        }
-
-        /* Bubble burst layer (pure CSS particles) */
-        .pu-bubbles {
-          position: absolute;
-          inset: 0;
-          pointer-events: none;
-          z-index: 1;
-          opacity: 0;
-        }
-
-        .pu-bubbles.on {
-          opacity: 1;
-        }
-
-        .pu-bubble {
-          position: absolute;
-          width: 10px;
-          height: 10px;
-          border-radius: 999px;
-          background: radial-gradient(
-            circle at 30% 30%,
-            rgba(255,255,255,0.35),
-            rgba(95,227,255,0.18) 45%,
-            rgba(90,168,255,0.05) 70%,
-            rgba(0,0,0,0) 75%
-          );
-          border: 1px solid rgba(95, 227, 255, 0.10);
-          box-shadow: 0 12px 28px rgba(0,0,0,0.25);
-          opacity: 0;
-          transform: translate3d(0,0,0) scale(0.6);
-        }
-
-        /* One-shot burst when drawer becomes open */
-        .pu-bubbles.on .pu-bubble {
-          animation: puBubblePop 1400ms cubic-bezier(0.22, 1, 0.36, 1) both;
-        }
-
-        @keyframes puBubblePop {
-          0%   { opacity: 0;   transform: translate3d(0,0,0) scale(0.6); }
-          30%  { opacity: 0.7; transform: translate3d(0,-4px,0) scale(1.0); }
-          100% { opacity: 0;   transform: translate3d(0,-28px,0) scale(1.25); }
-        }
-
-        /* Positions + stagger (10 bubbles) */
-        .pu-bubble:nth-child(1)  { left: 18px;  top: 86px;  width: 10px; height: 10px; animation-delay: 0ms; }
-        .pu-bubble:nth-child(2)  { right: 22px; top: 120px; width: 14px; height: 14px; animation-delay: 40ms; }
-        .pu-bubble:nth-child(3)  { left: 64px;  top: 170px; width: 8px;  height: 8px;  animation-delay: 80ms; }
-        .pu-bubble:nth-child(4)  { right: 60px; top: 190px; width: 11px; height: 11px; animation-delay: 120ms; }
-        .pu-bubble:nth-child(5)  { left: 34px;  top: 260px; width: 16px; height: 16px; animation-delay: 160ms; }
-        .pu-bubble:nth-child(6)  { right: 30px; top: 310px; width: 9px;  height: 9px;  animation-delay: 200ms; }
-        .pu-bubble:nth-child(7)  { left: 86px;  top: 360px; width: 12px; height: 12px; animation-delay: 240ms; }
-        .pu-bubble:nth-child(8)  { right: 92px; top: 420px; width: 10px; height: 10px; animation-delay: 280ms; }
-        .pu-bubble:nth-child(9)  { left: 46px;  top: 470px; width: 9px;  height: 9px;  animation-delay: 320ms; }
-.pu-bubble:nth-child(10) { right: 44px; top: 520px; width: 15px; height: 15px; animation-delay: 360ms; }
-
-        /* Animated glow ribbon + soft noise layer */
-        .pu-drawerPanel::before {
-          content: "";
-          position: absolute;
-          inset: -40% -30%;
-          background:
-            radial-gradient(40% 40% at 28% 28%, rgba(90, 168, 255, 0.20), rgba(0,0,0,0) 60%),
-            radial-gradient(45% 45% at 72% 54%, rgba(95, 227, 255, 0.16), rgba(0,0,0,0) 62%),
-            radial-gradient(35% 35% at 55% 82%, rgba(124, 140, 255, 0.14), rgba(0,0,0,0) 62%);
-          filter: blur(26px);
-          opacity: 0.9;
-          transform: translate3d(0,0,0);
-          animation: puDrawerGlow 10s ease-in-out infinite alternate;
-          z-index: 0;
-          pointer-events: none;
-        }
-
-        .pu-drawerPanel::after {
-          content: "";
-          position: absolute;
-          inset: 0;
-          background-image:
-            radial-gradient(rgba(255,255,255,0.06) 1px, transparent 1px);
-          background-size: 24px 24px;
-          opacity: 0.06;
-          mix-blend-mode: overlay;
-          z-index: 0;
-          pointer-events: none;
-        }
-
-        .pu-drawerPanel > * {
-          position: relative;
-          z-index: 2;
-        }
-
-        @keyframes puDrawerGlow {
-          0% {
-            transform: translate3d(-2%, -2%, 0) scale(1.02);
-          }
-          50% {
-            transform: translate3d(2%, -1%, 0) scale(1.04);
-          }
-          100% {
-            transform: translate3d(1%, 2%, 0) scale(1.03);
-          }
-        }
-
-        .pu-drawerHeader {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-          padding: 2px 2px 0 2px;
-        }
-
-        .pu-drawerClose {
-          width: 40px;
-          height: 40px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
-          cursor: pointer;
-          display: grid;
-          place-items: center;
-          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-        }
-
-        .pu-drawerClose:hover {
-          background: rgba(255, 255, 255, 0.06);
-          border-color: rgba(255, 255, 255, 0.18);
-          transform: translateY(-1px);
-        }
-
-        .pu-drawerUser {
-          margin-top: 6px;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          padding: 12px;
-          border-radius: 18px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.03);
-        }
-
-        .pu-drawerAvatar {
-          width: 42px;
-          height: 42px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          background: rgba(255, 255, 255, 0.06);
-          display: grid;
-          place-items: center;
-          font-weight: 950;
-          font-size: 13px;
-          color: rgba(255, 255, 255, 0.9);
-        }
-
-        .pu-drawerGreet {
-          font-size: 10px;
-          font-weight: 900;
-          letter-spacing: 0.08em;
-          text-transform: uppercase;
-          color: rgba(255, 255, 255, 0.55);
-          line-height: 1.1;
-        }
-
-        .pu-drawerName {
-          margin-top: 2px;
-          font-size: 13px;
-          font-weight: 950;
-          color: rgba(255, 255, 255, 0.90);
-          letter-spacing: -0.01em;
-          line-height: 1.1;
-        }
-
-        .pu-drawerSection {
-          margin-top: 10px;
-          padding: 0 6px;
-        }
-
-        .pu-drawerSectionLabel {
+        .pu-sectionLabel {
+          margin-top: 14px;
           font-size: 10px;
           font-weight: 900;
           letter-spacing: 0.10em;
           text-transform: uppercase;
           color: rgba(255, 255, 255, 0.48);
-          margin: 10px 6px;
         }
 
-        .pu-drawerNav {
+        .pu-sideNav {
+          margin-top: 10px;
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 8px;
         }
 
-        .pu-drawerItem {
+        .pu-sideItem {
           display: flex;
           align-items: center;
           gap: 12px;
-          padding: 12px;
+          padding: 11px 12px;
           border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.10);
-          background: rgba(255, 255, 255, 0.02);
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          background: rgba(255, 255, 255, 0.012);
           cursor: pointer;
           user-select: none;
-          transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
+          transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
           position: relative;
           overflow: hidden;
         }
 
-        .pu-drawerItem::before {
+        .pu-sideItem::after {
           content: "";
           position: absolute;
-          inset: 0;
-          background: linear-gradient(
-            120deg,
-            rgba(255,255,255,0.00) 0%,
-            rgba(255,255,255,0.08) 28%,
-            rgba(255,255,255,0.00) 58%
-          );
-          transform: translateX(-120%);
-          transition: transform 260ms ease;
-          opacity: 0.55;
+          inset: -40px;
+          background: radial-gradient(40% 35% at 20% 30%, rgba(95, 227, 255, 0.10), rgba(0, 0, 0, 0));
+          opacity: 0;
+          transform: translate3d(-8px, 0, 0);
+          transition: opacity 180ms ease, transform 180ms ease;
           pointer-events: none;
         }
 
-        .pu-drawerItem::after {
+        .pu-sideItem:hover {
+          background: rgba(255, 255, 255, 0.03);
+          border-color: rgba(255, 255, 255, 0.12);
+          transform: translateY(-1px);
+          box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28);
+        }
+
+        .pu-sideItem:hover::after {
+          opacity: 1;
+          transform: translate3d(0, 0, 0);
+        }
+
+        .pu-sideItem.active {
+          background: rgba(255, 255, 255, 0.04);
+          border-color: rgba(95, 227, 255, 0.24);
+          box-shadow: 0 24px 70px rgba(0, 0, 0, 0.40);
+        }
+
+        .pu-sideItem.active::before {
           content: "";
           position: absolute;
           left: 10px;
@@ -1807,77 +1692,26 @@ export default function DashboardPage() {
           bottom: 10px;
           width: 3px;
           border-radius: 999px;
-          background: linear-gradient(180deg, rgba(238, 9, 121, 0.0), rgba(238, 9, 121, 0.0));
-          opacity: 0;
-          transform: scaleY(0.6);
-          transition: opacity 140ms ease, transform 140ms ease;
-          pointer-events: none;
+          background: linear-gradient(180deg, var(--pu-accent-2), var(--pu-accent-1));
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 0 24px rgba(95, 227, 255, 0.22);
         }
 
-        .pu-drawerItem:hover {
-          background: rgba(255, 255, 255, 0.05);
-          border-color: rgba(255, 255, 255, 0.18);
-          transform: translateY(-1px);
-        }
+    
 
-        .pu-drawerItem:hover::before {
-          transform: translateX(120%);
-        }
-
-        .pu-drawerItem.active {
-          background: rgba(255, 255, 255, 0.06);
-          border-color: rgba(95, 227, 255, 0.30);
-          box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
-          transform: translateY(-1px);
-        }
-
-        .pu-drawerItem.active::after {
-          opacity: 1;
-          transform: scaleY(1);
-          background: linear-gradient(180deg, rgba(90, 168, 255, 0.95), rgba(95, 227, 255, 0.95));
-          animation: puActiveRail 1.6s ease-in-out infinite;
-        }
-
-        @keyframes puActiveRail {
-          0% { filter: blur(0px); opacity: 0.85; }
-          50% { filter: blur(0.6px); opacity: 1; }
-          100% { filter: blur(0px); opacity: 0.85; }
-        }
-
-        .pu-drawerItemLabel {
-          font-size: 12px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.88);
-        }
-
-        .pu-drawerItemIcon {
+        .pu-sideIcon {
           width: 18px;
           height: 18px;
           display: grid;
           place-items: center;
           color: rgba(255, 255, 255, 0.72);
-          transform: translateY(0);
-          transition: transform 140ms ease, filter 140ms ease;
         }
 
-        .pu-drawerItem:hover .pu-drawerItemIcon {
-          transform: translateY(-1px);
-          filter: brightness(1.12);
+        .pu-sideLabel {
+          font-size: 12px;
+          font-weight: 900;
+          color: rgba(255, 255, 255, 0.88);
         }
 
-        .pu-drawerItem.active .pu-drawerItemIcon {
-          filter: brightness(1.18);
-        }
-
-        .pu-drawerTitle {
-          font-size: 13px;
-          font-weight: 950;
-          letter-spacing: -0.01em;
-          background: linear-gradient(90deg, rgba(90, 168, 255, 0.95), rgba(95, 227, 255, 0.95));
-          -webkit-background-clip: text;
-          background-clip: text;
-          color: transparent;
-        }
 
         .pu-row {
           display: flex;
@@ -1926,32 +1760,73 @@ export default function DashboardPage() {
         {/* Sidebar */}
         <aside className="pu-glass pu-sidebar">
           <div className="pu-brand">Prepare-Up</div>
-          <div className="pu-subtitle">Recent projects</div>
-          <div className="pu-search">
-            <SearchIcon />
-            <input placeholder="Search projects…" />
-          </div>
 
-          <div className="pu-list">
-            {[
-              ["Software Development StudyGuide", "Today"],
-              ["Compiler Designing", "Yesterday"],
-              ["AI Study Guide Midterm", "2 days ago"],
-              ["Automated Theory Finals", "4 days ago"],
-              ["Mobile Computing Design", "1 week ago"],
-              ["Wireless Network Study Guide", "2 weeks ago"],
-            ].map(([title, sub]) => (
-              <div key={title} className="pu-item">
-                <div className="pu-itemTitle">{title}</div>
-                <div className="pu-itemSub">Last opened • {sub}</div>
+          <div className="pu-sectionLabel">MAIN</div>
+          <nav className="pu-sideNav" aria-label="Main navigation">
+            {(
+              [
+                ["chat", "Chat", <ChatIcon key="i" />],
+                ["flash_cards", "Flash Cards", <FlashCardsIcon key="i" />],
+                ["podcast", "Podcast", <MicIcon key="i" />],
+                ["mock_test", "Mock Test", <QuizIcon key="i" />],
+                ["study_guide", "Study Guide", <DocIcon key="i" />],
+              ] as Array<
+                ["chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide", string, React.ReactNode]
+              >
+            ).map(([key, label, icon]) => (
+              <div
+                key={key}
+                className={`pu-sideItem ${sidebarActive === key ? "active" : ""}`}
+                role="button"
+                tabIndex={0}
+                onClick={() => onSidebarSelect(key)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onSidebarSelect(key);
+                  }
+                }}
+              >
+                <div className="pu-sideIcon">{icon}</div>
+                <div className="pu-sideLabel">{label}</div>
               </div>
             ))}
+          </nav>
+
+          <div className="pu-sectionLabel" style={{ marginTop: 14 }}>
+            RECENTS
           </div>
+
+          <div className="pu-search" style={{ marginTop: 8 }}>
+            <SearchIcon />
+            <input
+            placeholder="Search chats…"
+            value={recentQuery}
+            onChange={(e) => {
+              setRecentQuery(e.target.value);
+              setRecentVisible(12);
+            }}
+          />
+          </div>
+
+          <div className="pu-list" aria-label="Recent chats" onScroll={onRecentsScroll}>
+          {visibleRecents.map((c) => (
+            <div key={c.id} className="pu-item pu-itemCompact">
+              <div className="pu-itemTitle">{c.title}</div>
+              <div className="pu-itemSub">{c.sub}</div>
+            </div>
+          ))}
+
+          <button className="pu-showAll" type="button" onClick={onShowAllRecents}>
+            Show all
+          </button>
+        </div>
         </aside>
 
         {/* Main */}
         <main className="pu-glass pu-main">
           <div className="pu-topbar">
+            <div />
             <div className="pu-userChip">
               <div className="pu-avatar">N</div>
               <div>
@@ -1959,9 +1834,6 @@ export default function DashboardPage() {
                 <div className="pu-userName">Nil Vaghela</div>
               </div>
             </div>
-            <button className="pu-hamburger" onClick={() => setDrawerOpen(true)} aria-label="Open menu">
-              <HamburgerIcon />
-            </button>
           </div>
 
           <div
@@ -2153,141 +2025,7 @@ export default function DashboardPage() {
           </div>
         </main>
       </div>
-
-      {/* Drawer overlay */}
-      {drawerOpen ? <div className="pu-overlay" aria-hidden="true" onClick={() => setDrawerOpen(false)} /> : null}
-
-      {/* Right drawer */}
-      <aside className={`pu-drawer ${drawerOpen ? "open" : ""}`} aria-hidden={!drawerOpen}>
-        <div className="pu-glass pu-drawerPanel">
-              <div className={`pu-bubbles ${drawerOpen ? "on" : ""}`} aria-hidden="true">
-              {Array.from({ length: 10 }).map((_, i) => (
-                <span key={i} className="pu-bubble" />
-              ))}
-            </div>
-          <div className="pu-drawerHeader">
-            <div className="pu-drawerTitle">Menu</div>
-            <button className="pu-drawerClose" onClick={() => setDrawerOpen(false)} type="button" aria-label="Close">
-              ✕
-            </button>
-          </div>
-
-          <div className="pu-drawerUser" aria-label="Account">
-            <div className="pu-drawerAvatar">N</div>
-            <div style={{ minWidth: 0 }}>
-              <div className="pu-drawerGreet">GOOD MORNING</div>
-              <div className="pu-drawerName">Nil Vaghela</div>
-            </div>
-          </div>
-
-          <div className="pu-drawerSection">
-            <div className="pu-drawerSectionLabel">Main</div>
-            <div className="pu-drawerNav">
-              <div
-                className={`pu-drawerItem ${drawerActive === "flash_cards" ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setDrawerActive("flash_cards");
-                    setDrawerOpen(false);
-                  }
-                }}
-                onClick={() => {
-                  setDrawerActive("flash_cards");
-                  setDrawerOpen(false);
-                }}
-              >
-                <div className="pu-drawerItemIcon"><FlashCardsIcon /></div>
-                <div className="pu-drawerItemLabel">Flash Cards</div>
-              </div>
-
-              <div
-                className={`pu-drawerItem ${drawerActive === "podcast" ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setDrawerActive("podcast");
-                    setDrawerOpen(false);
-                  }
-                }}
-                onClick={() => {
-                  setDrawerActive("podcast");
-                  setDrawerOpen(false);
-                }}
-              >
-                <div className="pu-drawerItemIcon"><MicIcon /></div>
-                <div className="pu-drawerItemLabel">Podcast</div>
-              </div>
-
-              <div
-                className={`pu-drawerItem ${drawerActive === "mock_test" ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setDrawerActive("mock_test");
-                    setDrawerOpen(false);
-                  }
-                }}
-                onClick={() => {
-                  setDrawerActive("mock_test");
-                  setDrawerOpen(false);
-                }}
-              >
-                <div className="pu-drawerItemIcon"><QuizIcon /></div>
-                <div className="pu-drawerItemLabel">Mock Test</div>
-              </div>
-
-              <div
-                className={`pu-drawerItem ${drawerActive === "study_guide" ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setDrawerActive("study_guide");
-                    setDrawerOpen(false);
-                  }
-                }}
-                onClick={() => {
-                  setDrawerActive("study_guide");
-                  setDrawerOpen(false);
-                }}
-              >
-                <div className="pu-drawerItemIcon"><DocIcon /></div>
-                <div className="pu-drawerItemLabel">Study Guide</div>
-              </div>
-
-              <div
-                className={`pu-drawerItem ${drawerActive === "saved_chats" ? "active" : ""}`}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setDrawerActive("saved_chats");
-                    setDrawerOpen(false);
-                  }
-                }}
-                onClick={() => {
-                  setDrawerActive("saved_chats");
-                  setDrawerOpen(false);
-                }}
-              >
-                <div className="pu-drawerItemIcon"><BookmarkIcon /></div>
-                <div className="pu-drawerItemLabel">Saved Chats</div>
-              </div>
-            </div>
-          </div>
-
-          <div style={{ flex: 1 }} />
-        </div>
-      </aside>
+      
     </div>
   );
 }
@@ -2385,11 +2123,18 @@ function DocIcon() {
   );
 }
 
-function BookmarkIcon() {
+//Code Publish
+function ChatIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M7 4h10a1 1 0 0 1 1 1v16l-6-3-6 3V5a1 1 0 0 1 1-1Z" stroke="rgba(255,255,255,0.72)" strokeWidth="2" strokeLinejoin="round" />
+      <path
+        d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v8Z"
+        stroke="rgba(255,255,255,0.72)"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+      <path d="M7.5 9.5h9" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" />
+      <path d="M7.5 13h6" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
-//Code Publish
