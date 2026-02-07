@@ -24,6 +24,20 @@ type ChatMessage = {
   loading?: boolean;
 };
 
+type ChatSession = {
+  id: string;
+  title: string;
+  updatedAt: number;
+
+  backendSessionId: string | null; // from /api/upload
+
+  uploaded: UploadedFile[];
+  combinedTextLen: number;
+
+  selectedOutput: OutputType | null;
+  messages: ChatMessage[];
+};
+
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
   const k = 1024;
@@ -38,42 +52,46 @@ function isAllowed(file: File) {
 }
 
 export default function DashboardPage() {
-  // Sidebar reflects the current page (chat). Feature items below trigger output selection.
-  const [sidebarActive, setSidebarActive] = useState<
-    "chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide"
-  >("chat");
-  const onSidebarSelect = (key: "chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
-    // Always keep the user in the current chat screen; sidebar is not a router.
-    if (view !== "chat") setView("chat");
+  // Sidebar is NOT a router. It only offers generation modes.
+  const [sidebarActive, setSidebarActive] = useState<"flash_cards" | "podcast" | "mock_test" | "study_guide" | null>(
+    null
+  );
 
-    if (key === "chat") {
-      setSidebarActive("chat");
+  const onSidebarSelect = (key: "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
+    // Do NOT let users pick a mode before they have uploaded.
+    // Otherwise we accidentally create empty threads like "New chat".
+    if (!sessionId && uploaded.length === 0) {
+      // Sprint 1: sidebar items are non-functional until upload exists
       return;
     }
 
-    // Map sidebar items to output selections
+    // Keep user on the single chat surface.
+    if (view !== "chat") setView("chat");
+
+    // Sprint 1: do not visually activate sidebar items
+    // setSidebarActive(key);
+
     if (key === "flash_cards") {
-      setSidebarActive("chat");
       setSelectedOutput("flash_card");
+      // upsertActiveSession({ selectedOutput: "flash_card" }); // removed per instructions
       return;
     }
 
     if (key === "podcast") {
-      setSidebarActive("chat");
       setSelectedOutput("podcast");
+      // upsertActiveSession({ selectedOutput: "podcast" }); // removed per instructions
       return;
     }
 
     if (key === "study_guide") {
-      setSidebarActive("chat");
       setSelectedOutput("study_guide");
+      // upsertActiveSession({ selectedOutput: "study_guide" }); // removed per instructions
       return;
     }
 
     // mock_test not implemented yet
     if (key === "mock_test") {
-      setSidebarActive("chat");
-      alert("Mock Test is coming soon. For now, use Study Guide or Flash Cards.");
+      // Sprint 1: no-op
       return;
     }
   };
@@ -105,32 +123,43 @@ export default function DashboardPage() {
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
-  // Sidebar recents (premium + infinite scroll mock)
+  // Real chat threads (created when the user uploads / starts chatting)
   const [recentQuery, setRecentQuery] = useState("");
   const [recentVisible, setRecentVisible] = useState(12);
+  const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const activeChatIdRef = useRef<string | null>(null);
 
-  const [recentChats, setRecentChats] = useState<Array<{ id: string; title: string; sub: string }>>(() => {
-    const base: Array<[string, string]> = [
-      ["NCR interview prep", "Today"],
-      ["ECON practice set", "Yesterday"],
-      ["Prepare-Up Sprint 1", "2 days ago"],
-      ["Database ERD notes", "4 days ago"],
-      ["LeetCode - graphs", "1 week ago"],
-      ["ML project ideas", "2 weeks ago"],
-    ];
-    const extra: Array<[string, string]> = Array.from({ length: 20 }).map((_, i) => [
-      `Chat ${i + 1 + base.length}`,
-      i < 10 ? "This month" : "Older",
-    ]);
-    const all = [...base, ...extra];
-    return all.map(([title, sub]) => ({ id: crypto.randomUUID(), title, sub }));
-  });
+  const setActiveChatIdSync = (id: string | null) => {
+    activeChatIdRef.current = id;
+    setActiveChatId(id);
+  };
+
+  type RecentThread = { id: string; title: string; sub: string };
+
+  const toRelativeSub = (ts: number) => {
+    const diffMs = Date.now() - ts;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 2) return "Just now";
+    if (diffMin < 60) return `${diffMin} min ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr} hr ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    if (diffDay === 1) return "Yesterday";
+    if (diffDay < 14) return `${diffDay} days ago`;
+    return "Older";
+  };
+
+  const threadRecents: RecentThread[] = useMemo(() => {
+    const sorted = [...chatSessions].sort((a, b) => b.updatedAt - a.updatedAt);
+    return sorted.map((s) => ({ id: s.id, title: s.title, sub: toRelativeSub(s.updatedAt) }));
+  }, [chatSessions]);
 
   const filteredRecents = useMemo(() => {
     const q = recentQuery.trim().toLowerCase();
-    if (!q) return recentChats;
-    return recentChats.filter((c) => c.title.toLowerCase().includes(q));
-  }, [recentQuery, recentChats]);
+    if (!q) return threadRecents;
+    return threadRecents.filter((c) => c.title.toLowerCase().includes(q));
+  }, [recentQuery, threadRecents]);
 
   const visibleRecents = useMemo(() => filteredRecents.slice(0, recentVisible), [filteredRecents, recentVisible]);
 
@@ -138,23 +167,104 @@ export default function DashboardPage() {
     const el = e.currentTarget;
     const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
     if (!nearBottom) return;
-
     setRecentVisible((v) => Math.min(v + 10, filteredRecents.length));
+  };
+  const startNewChat = () => {
+    setActiveChatIdSync(null);
+    setView("upload");
 
-    // If user reached end and still scrolling (and no search), append more mock items
-    if (recentVisible >= filteredRecents.length && recentQuery.trim() === "") {
-      setRecentChats((prev) => {
-        const more = Array.from({ length: 20 }).map((_, i) => ({
-          id: crypto.randomUUID(),
-          title: `Chat ${prev.length + i + 1}`,
-          sub: "Older",
-        }));
-        return [...prev, ...more];
-      });
-    }
+    setFiles([]);
+    // Ensure file input is cleared visually as well
+    if (inputRef.current) inputRef.current.value = "";
+    setUploaded([]);
+    setCombinedTextLen(0);
+    setSessionId(null);
+
+    setMessages([]);
+    setChatInput("");
+    setSelectedOutput(null);
+
+    setSidebarActive(null);
+    setRecentQuery("");
+    setRecentVisible(12);
   };
 
-  const onShowAllRecents = () => setRecentVisible((v) => Math.max(v, 200));
+  const openChatThread = (id: string) => {
+    const s = chatSessions.find((x) => x.id === id);
+    if (!s) return;
+
+    setActiveChatIdSync(s.id);
+    setView("chat");
+
+    setUploaded(s.uploaded);
+    setCombinedTextLen(s.combinedTextLen);
+    setSessionId(s.backendSessionId);
+
+    setSelectedOutput(s.selectedOutput);
+    setSidebarActive(
+      s.selectedOutput === "flash_card"
+        ? "flash_cards"
+        : s.selectedOutput === "podcast"
+        ? "podcast"
+        : s.selectedOutput === "study_guide"
+        ? "study_guide"
+        : null
+    );
+
+    setMessages(s.messages);
+  };
+
+  const upsertActiveSession = (patch: Partial<ChatSession>) => {
+    setChatSessions((prev) => {
+      const now = Date.now();
+      const currentId = activeChatIdRef.current;
+      const hasCurrent = !!currentId && prev.some((s) => s.id === currentId);
+
+      // If no active chat yet (or the ref is stale), create it ONLY when we have real content.
+      if (!hasCurrent) {
+        const nextUploaded = patch.uploaded ?? uploaded;
+        const nextBackendSid = patch.backendSessionId ?? sessionId;
+        const nextMessages = patch.messages ?? messages;
+
+        const hasRealUpload = nextUploaded.length > 0 || !!nextBackendSid;
+        const hasRealMessages = nextMessages.length > 0;
+
+        // No uploads + no session + no messages = don't create a thread.
+        if (!hasRealUpload && !hasRealMessages) return prev;
+
+        const newId = crypto.randomUUID();
+        const baseTitle = patch.title || (nextUploaded[0]?.name ? nextUploaded[0].name : "New chat");
+        const created: ChatSession = {
+          id: newId,
+          title: baseTitle,
+          updatedAt: now,
+          backendSessionId: nextBackendSid,
+          uploaded: nextUploaded,
+          combinedTextLen: patch.combinedTextLen ?? combinedTextLen,
+          selectedOutput: patch.selectedOutput ?? selectedOutput,
+          messages: nextMessages,
+        };
+        setActiveChatIdSync(newId);
+        return [created, ...prev];
+      }
+
+      // Patch existing
+      return prev.map((s) =>
+        s.id === currentId
+          ? {
+              ...s,
+              ...patch,
+              updatedAt: now,
+              backendSessionId: patch.backendSessionId ?? s.backendSessionId,
+              uploaded: patch.uploaded ?? s.uploaded,
+              combinedTextLen: patch.combinedTextLen ?? s.combinedTextLen,
+              selectedOutput: patch.selectedOutput ?? s.selectedOutput,
+              messages: patch.messages ?? s.messages,
+            }
+          : s
+      );
+    });
+  };
 
   const canContinue = files.length > 0 && !uploading;
 
@@ -179,6 +289,31 @@ export default function DashboardPage() {
     if (!el) return;
     el.scrollTop = el.scrollHeight;
   }, [messages.length]);
+
+  // Safety: if we have real chat state but no thread in Recents (can happen due to state timing), create one.
+  useEffect(() => {
+    if (chatSessions.length > 0) return;
+
+    const hasRealUpload = uploaded.length > 0 || !!sessionId;
+    const hasRealMessages = messages.length > 0;
+
+    if (!hasRealUpload && !hasRealMessages) return;
+
+    // Avoid creating a thread while we're still on the upload screen with nothing committed.
+    // Only create when user is in chat OR we already have a backend session id.
+    if (view === "upload" && !sessionId) return;
+
+    // Bootstrap a thread from current state.
+    upsertActiveSession({
+      backendSessionId: sessionId,
+      uploaded,
+      combinedTextLen,
+      selectedOutput,
+      messages,
+      title: uploaded[0]?.name ? uploaded[0].name : "New chat",
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatSessions.length, uploaded.length, sessionId, messages.length, view]);
 
   // -----------------------------
   // Background shaders (cool glass vibe)
@@ -726,10 +861,15 @@ export default function DashboardPage() {
 
       setUploaded(normalized);
       setCombinedTextLen(combinedLen);
+      // Only upsert here when we are already in chat (adding more files).
+      // For the first upload, we upsert once with both sources + initial messages below.
+      if (view !== "upload") {
+        upsertActiveSession({ backendSessionId: sid || sessionId, uploaded: normalized, combinedTextLen: combinedLen });
+      }
 
       if (view === "upload") {
         setView("chat");
-        setMessages([
+        const initialMessages: ChatMessage[] = [
           {
             id: crypto.randomUUID(),
             role: "user",
@@ -743,7 +883,15 @@ export default function DashboardPage() {
             meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
             text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
           },
-        ]);
+        ];
+        setMessages(initialMessages);
+        upsertActiveSession({
+          backendSessionId: sid || sessionId,
+          uploaded: normalized,
+          combinedTextLen: combinedLen,
+          messages: initialMessages,
+          title: normalized[0]?.name ? normalized[0].name : "New chat",
+        });
         setSelectedOutput(null);
       } else {
         setMessages((prev) =>
@@ -806,6 +954,7 @@ export default function DashboardPage() {
       return;
     }
     setSelectedOutput(k);
+    upsertActiveSession({ selectedOutput: k });
     setGenerating(true);
 
     const userMsg: ChatMessage = {
@@ -823,7 +972,11 @@ export default function DashboardPage() {
       loading: true,
     };
 
-    setMessages((prev) => [...prev, userMsg, aiLoading]);
+    setMessages((prev) => {
+      const next = [...prev, userMsg, aiLoading];
+      upsertActiveSession({ messages: next });
+      return next;
+    });
 
     try {
       const res = await fetch("http://localhost:8000/api/generate", {
@@ -856,13 +1009,19 @@ export default function DashboardPage() {
           ? data.response
           : JSON.stringify(data);
 
-      setMessages((prev) => prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m)));
+      setMessages((prev) => {
+        const next = prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+        upsertActiveSession({ messages: next });
+        return next;
+      });
     } catch (e: any) {
-      setMessages((prev) =>
-        prev.map((m) =>
+      setMessages((prev) => {
+        const next = prev.map((m) =>
           m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
-        )
-      );
+        );
+        upsertActiveSession({ messages: next });
+        return next;
+      });
     } finally {
       setGenerating(false);
     }
@@ -887,7 +1046,11 @@ export default function DashboardPage() {
     const aiLoadingId = crypto.randomUUID();
     const aiLoading: ChatMessage = { id: aiLoadingId, role: "ai", text: "Thinking…", loading: true };
 
-    setMessages((prev) => [...prev, userMsg, aiLoading]);
+    setMessages((prev) => {
+      const next = [...prev, userMsg, aiLoading];
+      upsertActiveSession({ messages: next });
+      return next;
+    });
 
     try {
       const res = await fetch("http://localhost:8000/api/chat", {
@@ -921,13 +1084,19 @@ export default function DashboardPage() {
           ? data.response
           : JSON.stringify(data);
 
-      setMessages((prev) => prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m)));
+      setMessages((prev) => {
+        const next = prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+        upsertActiveSession({ messages: next });
+        return next;
+      });
     } catch (e: any) {
-      setMessages((prev) =>
-        prev.map((m) =>
+      setMessages((prev) => {
+        const next = prev.map((m) =>
           m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
-        )
-      );
+        );
+        upsertActiveSession({ messages: next });
+        return next;
+      });
     } finally {
       setGenerating(false);
     }
@@ -1765,14 +1934,15 @@ export default function DashboardPage() {
           <nav className="pu-sideNav" aria-label="Main navigation">
             {(
               [
-                ["chat", "Chat", <ChatIcon key="i" />],
                 ["flash_cards", "Flash Cards", <FlashCardsIcon key="i" />],
                 ["podcast", "Podcast", <MicIcon key="i" />],
                 ["mock_test", "Mock Test", <QuizIcon key="i" />],
                 ["study_guide", "Study Guide", <DocIcon key="i" />],
-              ] as Array<
-                ["chat" | "flash_cards" | "podcast" | "mock_test" | "study_guide", string, React.ReactNode]
-              >
+              ] as Array<[
+                "flash_cards" | "podcast" | "mock_test" | "study_guide",
+                string,
+                React.ReactNode
+              ]>
             ).map(([key, label, icon]) => (
               <div
                 key={key}
@@ -1793,6 +1963,12 @@ export default function DashboardPage() {
             ))}
           </nav>
 
+          {chatSessions.length > 0 ? (
+            <button className="pu-showAll" type="button" onClick={startNewChat} style={{ marginTop: 12 }}>
+              + New chat
+            </button>
+          ) : null}
+
           <div className="pu-sectionLabel" style={{ marginTop: 14 }}>
             RECENTS
           </div>
@@ -1800,27 +1976,35 @@ export default function DashboardPage() {
           <div className="pu-search" style={{ marginTop: 8 }}>
             <SearchIcon />
             <input
-            placeholder="Search chats…"
-            value={recentQuery}
-            onChange={(e) => {
-              setRecentQuery(e.target.value);
-              setRecentVisible(12);
-            }}
-          />
+              placeholder="Search chats…"
+              value={recentQuery}
+              onChange={(e) => {
+                setRecentQuery(e.target.value);
+                setRecentVisible(12);
+              }}
+            />
           </div>
 
           <div className="pu-list" aria-label="Recent chats" onScroll={onRecentsScroll}>
-          {visibleRecents.map((c) => (
-            <div key={c.id} className="pu-item pu-itemCompact">
-              <div className="pu-itemTitle">{c.title}</div>
-              <div className="pu-itemSub">{c.sub}</div>
-            </div>
-          ))}
-
-          <button className="pu-showAll" type="button" onClick={onShowAllRecents}>
-            Show all
-          </button>
-        </div>
+            {visibleRecents.map((c) => (
+              <div
+                key={c.id}
+                className={`pu-item pu-itemCompact ${activeChatId === c.id ? "active" : ""}`}
+                role="button"
+                tabIndex={0}
+                onClick={() => openChatThread(c.id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openChatThread(c.id);
+                  }
+                }}
+              >
+                <div className="pu-itemTitle">{c.title}</div>
+                <div className="pu-itemSub">{c.sub}</div>
+              </div>
+            ))}
+          </div>
         </aside>
 
         {/* Main */}
