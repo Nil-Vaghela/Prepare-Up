@@ -1,6 +1,6 @@
 from __future__ import annotations
 from io import BytesIO
-from typing import Tuple
+from typing import Tuple, Callable, Optional
 
 from pypdf import PdfReader
 from docx import Document
@@ -17,13 +17,20 @@ PDF_MIME = "application/pdf"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 
+IMAGE_MIME_PREFIXES = ("image/",)
+IMAGE_EXTS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"
+)
+
 
 def _safe_decode(raw:bytes) ->str:
     try:
         return raw.decode("'utf-8'")
     except UnicodeDecodeError:
-        return raw.decode("latix-1",errors="replace")
+        return raw.decode("latin-1",errors="replace")
     
+OCRFN = Callable[[bytes], Tuple[str, str]]
+
 def extract_text_from_pdf(data:bytes) -> Tuple[str, str]:
     reader =  PdfReader(BytesIO(data))
     parts: list[str] = []
@@ -80,6 +87,10 @@ def extract_text_from_textlike(data: bytes) -> Tuple[str, str]:
     text = _safe_decode(data).strip()
     return ("extracted", text) if text else ("extracted", "")
 
+def extract_text_from_image(data: bytes) -> Tuple[str, str]:
+    # Placeholder for future OCR implementation
+    return ("needs_ocr", "")
+
 
 def pick_extractor(filename: str, mime: str):
     name = (filename or "").lower()
@@ -99,6 +110,29 @@ def pick_extractor(filename: str, mime: str):
     # Text-like (by mime prefix or extension)
     if mime.startswith(TEXT_MIME_PREFIXES) or name.endswith(TEXT_EXTS):
         return extract_text_from_textlike
+    
+    if mime.startswith(IMAGE_MIME_PREFIXES) or name.endswith(IMAGE_EXTS):
+        return extract_text_from_image
 
     # Unknown/binary: accept, but no extraction
     return None
+
+
+def extract_text_any(
+        *, filename: str, mime: str, data: bytes, ocr: Optional[OCRFN] = None
+) -> Tuple[str, str]:
+    extractor = pick_extractor(filename, mime)
+    if extractor is None:
+        return "unknown_format", ""
+    
+    status, text = extractor(data)
+    if status == "needs_ocr":
+        if ocr is None:
+            return "needs_ocr", ""
+        
+        ocr_text = (ocr(data) or "") .strip()
+        return ("ocr_extracted", ocr_text) if ocr_text else ("ocr_failed", "")
+    
+    return status, text
+
+        
