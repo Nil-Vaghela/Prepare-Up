@@ -7,7 +7,7 @@ from typing import List
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 
-from app.core.extractors import pick_extractor
+from app.core.extractors import extract_text_any
 
 router = APIRouter()
 
@@ -55,14 +55,15 @@ async def upload_files(files: List[UploadFile] = File(...)):
         if size > MAX_BYTES_PER_FILE:
             raise HTTPException(status_code=413, detail=f"File too large: {f.filename}")
 
-        extractor = pick_extractor(f.filename or "", f.content_type or "")
-        status, text = "uploaded", ""
-
-        if extractor:
-            try:
-                status, text = extractor(data)
-            except Exception:
-                status, text = "extract_failed", ""
+        try:
+            status, text = extract_text_any(
+                filename=f.filename or "",
+                mime=f.content_type or "",
+                data=data,
+                ocr=None,  # OCR will be plugged in later (Textract / Tesseract)
+            )
+        except Exception:
+            status, text = "extract_failed", ""
 
         out.append({
             "id": str(uuid.uuid4()),
@@ -78,8 +79,15 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
     combined_text = "\n\n".join(combined_parts).strip()
 
-    if not combined_text:
+    # If we got no extracted text, allow the upload to succeed when files need OCR
+    # (e.g., screenshots / images / scanned PDFs). Otherwise, treat it as a true failure.
+    needs_ocr = any(item.get("status") == "needs_ocr" for item in out)
+    if not combined_text and not needs_ocr:
         raise HTTPException(status_code=400, detail="Could not extract text from the uploaded files.")
+
+    # For OCR-pending uploads, store an empty session text for now (Sprint 2 will fill this after OCR).
+    if not combined_text and needs_ocr:
+        combined_text = ""
 
     session_id = str(uuid.uuid4())
     try:
