@@ -10,21 +10,23 @@
   --pu-text: rgba(255, 255, 255, 0.92);
   --pu-muted: rgba(255, 255, 255, 0.62);
 
-  /* Glass */
-  --pu-glass: rgba(255, 255, 255, 0.075);        /* default panel */
-  --pu-glass-strong: rgba(255, 255, 255, 0.10);  /* more opaque */
-  --pu-glass-soft: rgba(255, 255, 255, 0.055);   /* less opaque */
+  /* Glass (glossy) */
+  --pu-glass: rgba(255, 255, 255, 0.055);        /* default panel (more transparent) */
+  --pu-glass-strong: rgba(255, 255, 255, 0.075); /* more opaque */
+  --pu-glass-soft: rgba(255, 255, 255, 0.040);   /* less opaque */
 
   --pu-border: rgba(255, 255, 255, 0.14);
   --pu-border-soft: rgba(255, 255, 255, 0.10);
-  --pu-shadow: rgba(0, 0, 0, 0.55);
+  --pu-shadow: rgba(0, 0, 0, 0.60);
 
-  /* Accent (sparingly) */
-  --pu-accent-1: #ee0979;
-  --pu-accent-2: #ff6a00;
+  /* Accent (cool dashboard palette) */
+  --pu-accent-1: #5aa8ff;
+  --pu-accent-2: #5fe3ff;
 
-  /* Glass optics */
-  --pu-blur: 22px;
+  /* Glass optics (real glass knobs) */
+  --pu-blur: 14px;      /* main blur strength */
+  --pu-blur-strong: 18px;
+  --pu-blur-soft: 10px;
   --pu-sat: 150%;
   --pu-radius-panel: 18px;
   --pu-radius-card: 14px;
@@ -38,21 +40,80 @@
   overflow: hidden;
 }
 
-/* Base glass panel */
+/* Base glass panel (real glass, glossy – not matte) */
 .pu-glass {
-  background: var(--pu-glass);
-  backdrop-filter: blur(var(--pu-blur)) saturate(var(--pu-sat));
-  -webkit-backdrop-filter: blur(var(--pu-blur)) saturate(var(--pu-sat));
-  border: 1px solid var(--pu-border-soft);
-  outline: 1px solid rgba(255, 255, 255, 0.06);
-  outline-offset: -1px;
-  box-shadow: 0 24px 70px var(--pu-shadow), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  border-radius: var(--pu-radius-panel);
+  position: relative;
+  border-radius: var(--pu-radius-lg);
+  border: 1px solid var(--pu-border);
+
+  /* REAL glass */
+  background: rgba(10, 12, 18, 0.36);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(18px) saturate(140%);
+
+  box-shadow: var(--pu-shadow);
+  overflow: hidden;
+  will-change: backdrop-filter;
+}
+
+/* Fallback if blur isn't supported */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .pu-glass {
+    background: rgba(10, 12, 18, 0.62);
+  }
+}
+
+/* Optional blur variants */
+.pu-glass--blur-strong {
+  backdrop-filter: blur(var(--pu-blur-strong)) saturate(var(--pu-sat)) contrast(1.05);
+  -webkit-backdrop-filter: blur(var(--pu-blur-strong)) saturate(var(--pu-sat)) contrast(1.05);
+}
+
+.pu-glass--blur-soft {
+  backdrop-filter: blur(var(--pu-blur-soft)) saturate(var(--pu-sat)) contrast(1.05);
+  -webkit-backdrop-filter: blur(var(--pu-blur-soft)) saturate(var(--pu-sat)) contrast(1.05);
+}
+
+/* Keep content above sheen layers */
+.pu-glass > * {
+  position: relative;
+  z-index: 2;
+}
+
+/* Specular highlight (controlled – avoids milky haze) */
+.pu-glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background:
+    radial-gradient(76% 52% at 26% 12%, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.00) 62%),
+    radial-gradient(62% 44% at 78% 8%, rgba(90, 168, 255, 0.14), rgba(0, 0, 0, 0.00) 66%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.00) 44%);
+  opacity: 0.28;
+}
+
+/* Top-edge sheen */
+.pu-glass::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  pointer-events: none;
+  z-index: 1;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.22),
+    rgba(255, 255, 255, 0.06) 16%,
+    rgba(255, 255, 255, 0.00) 54%
+  );
+  opacity: 0.10;
 }
 
 /* Strength variants */
 .pu-glass--strong {
   background: var(--pu-glass-strong);
+  filter: saturate(1.05);
 }
 
 .pu-glass--soft {
@@ -79,7 +140,7 @@
 .pu-glass--hover:hover {
   transform: translateY(-1px);
   border-color: rgba(255, 255, 255, 0.18);
-  background: rgba(255, 255, 255, 0.085);
+  background: linear-gradient(180deg, rgba(255,255,255,0.070), rgba(255,255,255,0.018));
 }
 
 /* Text helpers for dark UI */
