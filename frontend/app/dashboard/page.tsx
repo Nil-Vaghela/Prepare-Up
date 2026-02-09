@@ -333,11 +333,20 @@ export default function DashboardPage() {
     const mount = bgMountRef.current;
     if (!mount) return;
 
-    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const ua = navigator.userAgent;
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+    const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
+    const isChrome = /Chrome\//i.test(ua) && !/Edg\//i.test(ua) && !/OPR\//i.test(ua);
     const isLowPower = isMobile || (navigator.hardwareConcurrency || 4) <= 4;
 
-    const dpr = Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 2);
+    // Chrome + backdrop-filter + WebGL can get expensive. Cap DPR more aggressively on Chrome.
+    const dprCap = isMobile ? 1.25 : isChrome ? 1.5 : 2;
+    const dpr = Math.min(window.devicePixelRatio || 1, dprCap);
+
+    // Respect reduced motion
+    const prefersReducedMotion = typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      : false;
 
     const scene = new THREE.Scene();
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
@@ -380,7 +389,7 @@ export default function DashboardPage() {
       uResolution: { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
       uActualResolution: { value: new THREE.Vector2(window.innerWidth * dpr, window.innerHeight * dpr) },
       uMouse: { value: new THREE.Vector2(0.5, 0.5) },
-      uCount: { value: isMobile ? 4 : 7 },
+      uCount: { value: isMobile ? 4 : isChrome ? 5 : 7 },
       uSmooth: { value: 0.55 },
       uSpeed: { value: 0.62 },
       uContrast: { value: 1.7 },
@@ -391,6 +400,7 @@ export default function DashboardPage() {
       uLight2: { value: new THREE.Color(0x5aa8ff) },
       uIsSafari: { value: isSafari ? 1.0 : 0.0 },
       uIsLowPower: { value: isLowPower ? 1.0 : 0.0 },
+      uIsChrome: { value: isChrome ? 1.0 : 0.0 },
     };
 
     const material = new THREE.ShaderMaterial({
@@ -420,6 +430,7 @@ export default function DashboardPage() {
         uniform vec3 uLight2;
         uniform float uIsSafari;
         uniform float uIsLowPower;
+        uniform float uIsChrome;
 
         const float PI = 3.14159265359;
         const float EPS = 0.001;
@@ -489,7 +500,7 @@ export default function DashboardPage() {
 
         float rayMarch(vec3 ro, vec3 rd) {
           float t = 0.0;
-          int steps = (uIsSafari > 0.5) ? 20 : (uIsLowPower > 0.5 ? 18 : 44);
+          int steps = (uIsLowPower > 0.5) ? 16 : ((uIsSafari > 0.5) ? 20 : ((uIsChrome > 0.5) ? 30 : 40));
 
           for (int i = 0; i < 64; i++) {
             if (i >= steps) break;
@@ -596,14 +607,16 @@ export default function DashboardPage() {
 
     const clock = new THREE.Clock();
 
-    const setMouse = (x: number, y: number) => {
-      uniforms.uMouse.value.set(x / window.innerWidth, 1.0 - y / window.innerHeight);
+    // Throttle pointer updates: store target and lerp in RAF
+    const mouseTarget = new THREE.Vector2(0.5, 0.5);
+    const setMouseTarget = (x: number, y: number) => {
+      mouseTarget.set(x / window.innerWidth, 1.0 - y / window.innerHeight);
     };
 
-    const onMouseMove = (e: MouseEvent) => setMouse(e.clientX, e.clientY);
+    const onMouseMove = (e: MouseEvent) => setMouseTarget(e.clientX, e.clientY);
     const onTouchMove = (e: TouchEvent) => {
       if (!e.touches[0]) return;
-      setMouse(e.touches[0].clientX, e.touches[0].clientY);
+      setMouseTarget(e.touches[0].clientX, e.touches[0].clientY);
     };
 
     window.addEventListener("mousemove", onMouseMove, { passive: true });
@@ -625,12 +638,26 @@ export default function DashboardPage() {
     window.addEventListener("resize", onResize, { passive: true });
 
     // init center
-    setMouse(window.innerWidth / 2, window.innerHeight / 2);
+    setMouseTarget(window.innerWidth / 2, window.innerHeight / 2);
 
     let raf = 0;
+    let running = true;
+
+    const onVis = () => {
+      running = document.visibilityState === "visible";
+    };
+
+    document.addEventListener("visibilitychange", onVis, { passive: true });
+
     const tick = () => {
       raf = window.requestAnimationFrame(tick);
+      if (!running || prefersReducedMotion) return;
+
       uniforms.uTime.value = clock.getElapsedTime();
+
+      // Smooth mouse (cheap) – makes it feel premium and reduces jitter work
+      uniforms.uMouse.value.lerp(mouseTarget, 0.12);
+
       renderer.render(scene, camera);
     };
 
@@ -640,6 +667,7 @@ export default function DashboardPage() {
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("touchmove", onTouchMove);
       window.removeEventListener("resize", onResize);
+      document.removeEventListener("visibilitychange", onVis);
       window.cancelAnimationFrame(raf);
 
       material.dispose();
@@ -1097,8 +1125,8 @@ export default function DashboardPage() {
 
         /* REAL glass */
         background: rgba(10, 12, 18, 0.36);
-        -webkit-backdrop-filter: blur(18px) saturate(140%);
-        backdrop-filter: blur(18px) saturate(140%);
+        -webkit-backdrop-filter: blur(14px) saturate(140%);
+        backdrop-filter: blur(14px) saturate(140%);
 
         box-shadow: var(--pu-shadow);
         overflow: hidden;
@@ -1922,7 +1950,7 @@ export default function DashboardPage() {
                       </div>
                     </div>
                     <div className="pu-btnRow">
-                      <button className="pu-btn" onClick={onBrowse} type="button">
+                      <button className="pu-btn" onClick={onBrowse} type="button" suppressHydrationWarning>
                         Browse
                       </button>
                       <button
@@ -1930,6 +1958,7 @@ export default function DashboardPage() {
                         onClick={onContinue}
                         disabled={!canContinue}
                         type="button"
+                        suppressHydrationWarning
                       >
                         {uploading ? "Uploading…" : "Continue"}
                       </button>
@@ -1943,7 +1972,7 @@ export default function DashboardPage() {
                         <div className="pu-dropSub">Supported: most file types • Local selection</div>
                       </div>
                       <div className="pu-btnRow">
-                        <button className="pu-btn" onClick={onBrowse} type="button">
+                        <button className="pu-btn" onClick={onBrowse} type="button" suppressHydrationWarning>
                           Select files
                         </button>
                       </div>
@@ -1960,7 +1989,12 @@ export default function DashboardPage() {
                             <div className="pu-fileName">{f.file.name}</div>
                             <div className="pu-fileSize">{formatBytes(f.file.size)}</div>
                           </div>
-                          <button className="pu-remove" onClick={() => removeFile(f.id)} aria-label="Remove file">
+                          <button
+                            className="pu-remove"
+                            onClick={() => removeFile(f.id)}
+                            aria-label="Remove file"
+                            suppressHydrationWarning
+                          >
                             ✕
                           </button>
                         </div>
@@ -2016,7 +2050,7 @@ export default function DashboardPage() {
                 {/* Bottom bar */}
                 <div className="pu-chatBarWrap">
                   <div className="pu-chatBar">
-                    <button className="pu-attach" type="button" onClick={onUploadMore}>
+                    <button className="pu-attach" type="button" onClick={onUploadMore} suppressHydrationWarning>
                       <PaperclipIcon />
                       <span className="pu-attachText">
                         {uploaded.length || 0} file(s)
@@ -2055,6 +2089,7 @@ export default function DashboardPage() {
                       onClick={onSendChat}
                       disabled={generating || !chatInput.trim() || !selectedOutput}
                       aria-label="Send"
+                      suppressHydrationWarning
                     >
                       <SendIcon />
                     </button>
