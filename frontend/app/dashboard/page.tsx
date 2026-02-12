@@ -279,6 +279,17 @@ export default function DashboardPage() {
 
   const canContinue = files.length > 0 && !uploading;
 
+  // -----------------------------
+  // Discord integration (simple redirect)
+  // -----------------------------
+  const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  const DISCORD_CONNECT_URL =
+    process.env.NEXT_PUBLIC_DISCORD_CONNECT_URL || `${BACKEND_BASE}/api/auth/discord`;
+
+  const onConnectDiscord = () => {
+    window.location.href = DISCORD_CONNECT_URL;
+  };
+
   // Auto-upload-more behavior (no sync button)
   const pendingUploadCount = Math.max(0, files.length - uploaded.length);
   const autoSyncLockRef = useRef(false);
@@ -1545,6 +1556,24 @@ export default function DashboardPage() {
           color: var(--pu-muted);
         }
 
+        .pu-dot {
+          width: 10px;
+          height: 10px;
+          border-radius: 999px;
+          display: inline-block;
+          margin-right: 10px;
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+        }
+
+        .pu-dot.idle {
+          background: rgba(255, 255, 255, 0.30);
+        }
+
+        .pu-dot.ok {
+          background: linear-gradient(90deg, var(--pu-accent-1), var(--pu-accent-2));
+          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 16px rgba(95, 227, 255, 0.18);
+        }
+
         .pu-fileList {
           margin-top: 14px;
           display: flex;
@@ -1965,6 +1994,29 @@ export default function DashboardPage() {
                     </div>
                   </div>
 
+                  {/* Discord integration */}
+                  <div className="pu-drop pu-discord">
+                    <div className="pu-dropInner">
+                      <div>
+                        <div className="pu-dropTitle">
+                          <span className="pu-dot idle" />
+                          Connect Discord
+                        </div>
+
+                        <div className="pu-dropSub">
+                          Link your Discord account so we can import your server/channel content.
+                        </div>
+                      </div>
+
+                      <div className="pu-btnRow">
+                        <button className="pu-btn" onClick={onConnectDiscord} type="button" suppressHydrationWarning>
+                          <LinkIcon />
+                          Connect
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   <div className={`pu-drop${dragging ? " drag" : ""}`}>
                     <div className="pu-dropInner">
                       <div>
@@ -2211,6 +2263,42 @@ function ChatIcon() {
       />
       <path d="M7.5 9.5h9" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" />
       <path d="M7.5 13h6" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function LinkIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M10.5 13.5 13.5 10.5" stroke="rgba(255,255,255,0.85)" strokeWidth="2" strokeLinecap="round" />
+      <path
+        d="M8.5 15.5 7 17a4 4 0 0 1-5.7-5.7l1.5-1.5a4 4 0 0 1 5.7 0"
+        stroke="rgba(255,255,255,0.85)"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M15.5 8.5 17 7a4 4 0 0 1 5.7 5.7l-1.5 1.5a4 4 0 0 1-5.7 0"
+        stroke="rgba(255,255,255,0.85)"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3v10" stroke="rgba(255,255,255,0.85)" strokeWidth="2" strokeLinecap="round" />
+      <path
+        d="M8 11l4 4 4-4"
+        stroke="rgba(255,255,255,0.85)"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M5 21h14" stroke="rgba(255,255,255,0.55)" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
