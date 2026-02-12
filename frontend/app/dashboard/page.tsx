@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
+type DiscordConnectState = "idle" | "connecting" | "connected" | "error";
+
 type LocalFile = { id: string; file: File };
 
 type UploadedFile = {
@@ -280,14 +282,94 @@ export default function DashboardPage() {
   const canContinue = files.length > 0 && !uploading;
 
   // -----------------------------
-  // Discord integration (simple redirect)
+  // Discord integration
   // -----------------------------
   const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
   const DISCORD_CONNECT_URL =
     process.env.NEXT_PUBLIC_DISCORD_CONNECT_URL || `${BACKEND_BASE}/api/auth/discord`;
 
+  // Optional: used to generate a bot invite link (server install)
+  const DISCORD_CLIENT_ID = process.env.NEXT_PUBLIC_DISCORD_CLIENT_ID || "";
+  const DISCORD_BOT_INVITE_URL =
+    process.env.NEXT_PUBLIC_DISCORD_BOT_INVITE_URL ||
+    (DISCORD_CLIENT_ID
+      ? `https://discord.com/oauth2/authorize?client_id=${encodeURIComponent(
+          DISCORD_CLIENT_ID
+        )}&scope=bot%20applications.commands&permissions=0&guild_select=true&disable_guild_select=false`
+      : "");
+
+  const [discordState, setDiscordState] = useState<DiscordConnectState>("idle");
+  const [discordError, setDiscordError] = useState<string>("");
+
+  // Read the redirect result from the URL once (prevents repeated token exchange loops)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const url = new URL(window.location.href);
+    const p = url.searchParams;
+
+    const connectedFlag = p.get("discord");
+    const err = p.get("error") || p.get("err") || p.get("discord_error");
+    const errDesc = p.get("error_description") || p.get("errorDescription") || "";
+
+    if (connectedFlag === "connected") {
+      setDiscordState("connected");
+      setDiscordError("");
+
+      // Clear the query param so refresh doesn't re-run anything / confuse the UI
+      p.delete("discord");
+      if (p.toString() !== url.searchParams.toString()) {
+        // (this check is mostly defensive)
+      }
+      const clean = `${url.pathname}${p.toString() ? `?${p.toString()}` : ""}${url.hash || ""}`;
+      window.history.replaceState({}, "", clean);
+      return;
+    }
+
+    if (err) {
+      setDiscordState("error");
+      setDiscordError(errDesc ? `${err}: ${errDesc}` : err);
+
+      // Clear error params after reading
+      p.delete("error");
+      p.delete("err");
+      p.delete("discord_error");
+      p.delete("error_description");
+      p.delete("errorDescription");
+      const clean = `${url.pathname}${p.toString() ? `?${p.toString()}` : ""}${url.hash || ""}`;
+      window.history.replaceState({}, "", clean);
+      return;
+    }
+  }, []);
+
   const onConnectDiscord = () => {
-    window.location.href = DISCORD_CONNECT_URL;
+    if (typeof window === "undefined") return;
+
+    // Prevent double-clicks / repeated redirects (common cause of rate-limits)
+    if (discordState === "connecting") return;
+
+    setDiscordState("connecting");
+    setDiscordError("");
+
+    // Save an intent marker so if the user comes back without params we can still show a helpful message later
+    try {
+      window.sessionStorage.setItem("pu_discord_connecting", "1");
+    } catch {
+      // ignore
+    }
+
+    window.location.assign(DISCORD_CONNECT_URL);
+  };
+
+  const onInviteBot = () => {
+    if (!DISCORD_BOT_INVITE_URL) {
+      setDiscordState("error");
+      setDiscordError(
+        "Missing Discord Client ID. Set NEXT_PUBLIC_DISCORD_CLIENT_ID (or NEXT_PUBLIC_DISCORD_BOT_INVITE_URL) in the frontend env."
+      );
+      return;
+    }
+    window.open(DISCORD_BOT_INVITE_URL, "_blank", "noopener,noreferrer");
   };
 
   // Auto-upload-more behavior (no sync button)
@@ -1999,19 +2081,47 @@ export default function DashboardPage() {
                     <div className="pu-dropInner">
                       <div>
                         <div className="pu-dropTitle">
-                          <span className="pu-dot idle" />
-                          Connect Discord
+                          <span className={`pu-dot ${discordState === "connected" ? "ok" : "idle"}`} />
+                          Discord
                         </div>
 
                         <div className="pu-dropSub">
-                          Link your Discord account so we can import your server/channel content.
+                          {discordState === "connected"
+                            ? "Discord connected. Next: add the bot to a server (if you haven’t yet)."
+                            : discordState === "connecting"
+                            ? "Opening Discord authorization…"
+                            : "Link your Discord account so we can import your server/channel content."}
                         </div>
+
+                        {discordState === "error" && discordError ? (
+                          <div className="pu-dropSub" style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}>
+                            ⚠️ {discordError}
+                          </div>
+                        ) : null}
                       </div>
 
                       <div className="pu-btnRow">
-                        <button className="pu-btn" onClick={onConnectDiscord} type="button" suppressHydrationWarning>
+                        <button
+                          className={`pu-btn ${discordState === "connecting" ? "pu-btnDisabled" : ""}`}
+                          onClick={onConnectDiscord}
+                          type="button"
+                          disabled={discordState === "connecting"}
+                          suppressHydrationWarning
+                        >
                           <LinkIcon />
-                          Connect
+                          {discordState === "connected" ? "Reconnect" : discordState === "connecting" ? "Connecting…" : "Connect"}
+                        </button>
+
+                        <button
+                          className={`pu-btn ${!DISCORD_BOT_INVITE_URL ? "pu-btnDisabled" : ""}`}
+                          onClick={onInviteBot}
+                          type="button"
+                          disabled={!DISCORD_BOT_INVITE_URL}
+                          suppressHydrationWarning
+                          title={!DISCORD_BOT_INVITE_URL ? "Set NEXT_PUBLIC_DISCORD_CLIENT_ID or NEXT_PUBLIC_DISCORD_BOT_INVITE_URL" : ""}
+                        >
+                          <DownloadIcon />
+                          Add Bot
                         </button>
                       </div>
                     </div>
