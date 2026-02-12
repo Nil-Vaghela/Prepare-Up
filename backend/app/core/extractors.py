@@ -22,14 +22,43 @@ IMAGE_EXTS = (
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"
 )
 
+# Optional OCR dependencies (only used if installed)
+try:
+    from PIL import Image  # type: ignore
+except Exception:  # pragma: no cover
+    Image = None  # type: ignore
 
-def _safe_decode(raw:bytes) ->str:
+try:
+    import pytesseract  # type: ignore
+except Exception:  # pragma: no cover
+    pytesseract = None  # type: ignore
+
+
+def _ocr_image_bytes(data: bytes) -> str:
+    """OCR an image byte payload to text.
+
+    Requires Pillow + pytesseract to be installed. If not available, returns "".
+    """
+    if Image is None or pytesseract is None:
+        return ""
+
     try:
-        return raw.decode("'utf-8'")
+        img = Image.open(BytesIO(data))
+        # normalize to RGB for OCR
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        return (pytesseract.image_to_string(img) or "").strip()
+    except Exception:
+        return ""
+
+
+def _safe_decode(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
     except UnicodeDecodeError:
-        return raw.decode("latin-1",errors="replace")
+        return raw.decode("latin-1", errors="replace")
     
-OCRFN = Callable[[bytes], Tuple[str, str]]
+OCRFN = Callable[[bytes], str]
 
 def extract_text_from_pdf(data:bytes) -> Tuple[str, str]:
     reader =  PdfReader(BytesIO(data))
@@ -88,7 +117,10 @@ def extract_text_from_textlike(data: bytes) -> Tuple[str, str]:
     return ("extracted", text) if text else ("extracted", "")
 
 def extract_text_from_image(data: bytes) -> Tuple[str, str]:
-    # Placeholder for future OCR implementation
+    # Try built-in OCR if Pillow + pytesseract are available.
+    text = _ocr_image_bytes(data)
+    if text:
+        return ("ocr_extracted", text)
     return ("needs_ocr", "")
 
 
@@ -127,12 +159,12 @@ def extract_text_any(
     
     status, text = extractor(data)
     if status == "needs_ocr":
-        if ocr is None:
-            return "needs_ocr", ""
-        
-        ocr_text = (ocr(data) or "") .strip()
-        return ("ocr_extracted", ocr_text) if ocr_text else ("ocr_failed", "")
+        # If caller provided a custom OCR function, prefer it.
+        if ocr is not None:
+            ocr_text = (ocr(data) or "").strip()
+            return ("ocr_extracted", ocr_text) if ocr_text else ("ocr_failed", "")
+
+        # Otherwise, for images we may have already tried built-in OCR; for PDFs/scans we still need OCR.
+        return ("needs_ocr", "")
     
     return status, text
-
-        

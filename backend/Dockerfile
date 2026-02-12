@@ -5,9 +5,13 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# System deps (optional but good hygiene for many libs)
+# System deps (curl + OCR runtime)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    tesseract-ocr \
+    libtesseract-dev \
+    libleptonica-dev \
+    poppler-utils \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
