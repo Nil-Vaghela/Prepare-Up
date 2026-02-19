@@ -124,6 +124,7 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
+  const isAnonymous = true;
   const chatListRef = useRef<HTMLDivElement | null>(null);
   // Real chat threads (created when the user uploads / starts chatting)
   const [recentQuery, setRecentQuery] = useState("");
@@ -2167,8 +2168,29 @@ export default function DashboardPage() {
               </div>
             ) : (
               <div className="pu-chatCanvas">
+                
                 {/* Chat feed */}
                 <div ref={chatListRef} className="pu-chatScroll">
+                  {
+                  isAnonymous ? (
+                    <div
+                    style={{
+                      margin:"0 10px 6px 10px",
+                      padding:"10px 14px",
+                      borderRadius:"14px",
+                      border: "1px solid rgba(255,255,255,0.12)",
+                      background: "rgba(48, 48, 48, 0.85)",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      color: "rgba(255,255,255,0.85)",
+                      backdropFilter: "blur(10px)",
+                      WebkitBackdropFilter: "blur(10px)",
+
+                    }}
+                    > You are using anonymous mode. Chats and uploads will not be saved after you close this tab.
+                    </div>
+                  ) : null
+                }
                   {messages.map((m) => (
                     <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "right" : "left"}`}>
                       <div className={`pu-msgBubble ${m.role === "user" ? "user" : "ai"}`}>
@@ -2182,7 +2204,7 @@ export default function DashboardPage() {
                   {!selectedOutput ? (
                     <div className="pu-msgRow right">
                       <div className="pu-outputPickerInFeed">
-                        <div className="pu-pickerTitle">What should I make from your notes?</div>
+                        <div className="pu-pickerTitle">What should I make from your notes ??</div>
                         <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
                         <div className="pu-outputRow">
                           {(
