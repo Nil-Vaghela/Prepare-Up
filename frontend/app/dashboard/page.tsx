@@ -124,7 +124,8 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
-  const isAnonymous = true;
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const isAnonymous = !accessToken;
   const chatListRef = useRef<HTMLDivElement | null>(null);
   // Real chat threads (created when the user uploads / starts chatting)
   const [recentQuery, setRecentQuery] = useState("");
@@ -818,7 +819,11 @@ export default function DashboardPage() {
       const form = new FormData();
       for (const f of files) form.append("files", f.file);
 
-      const res = await fetch("http://localhost:8000/api/upload", { method: "POST", body: form });
+      const res = await fetch(`${BACKEND_BASE}/api/upload`, {
+        method: "POST",
+        body: form,
+        credentials: "include",
+      });
       if (!res.ok) {
         const msg = await res.text();
         throw new Error(msg || "Upload failed");
@@ -983,9 +988,10 @@ export default function DashboardPage() {
     });
 
     try {
-      const res = await fetch("http://localhost:8000/api/generate", {
+      const res = await fetch(`${BACKEND_BASE}/api/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({
           session_id: sessionId,
           output_type: k,
@@ -1057,9 +1063,10 @@ export default function DashboardPage() {
     });
 
     try {
-      const res = await fetch("http://localhost:8000/api/chat", {
+      const res = await fetch(`${BACKEND_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({
           session_id: sessionId,
           message: text,
