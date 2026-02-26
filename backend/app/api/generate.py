@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Literal, Optional
@@ -13,10 +14,10 @@ router = APIRouter()
 
 
 def _get_client() -> OpenAI:
-    try:
-        return OpenAI()
-    except Exception:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in the backend environment.")
+    return OpenAI(api_key=api_key)
 
 TMP_DIR = Path("/tmp/prepareup_sessions")
 SESSION_TTL_SECONDS = 60 * 30
@@ -173,25 +174,30 @@ def generate(req: GenerateRequest):
             )
             user_instruction = f"CONTENT:\n{corpus}\n\nReturn the narrative as plain text in the 'text' field."
 
-    resp = _get_client().responses.create(
-        model="gpt-5-nano",  # or whatever model you’re using
-        input=[
+    # Use Chat Completions (compatible across OpenAI SDK versions)
+    model_name = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+
+    resp = _get_client().chat.completions.create(
+        model=model_name,
+        messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": user_instruction},
+            {
+                "role": "user",
+                "content": (
+                    "Return ONLY valid JSON. No extra text.\n\n"
+                    f"Schema (JSON Schema wrapper):\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+                    f"{user_instruction}"
+                ),
+            },
         ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": schema["name"],
-                "schema": schema["schema"],
-            }
-        },
+        response_format={"type": "json_object"},
     )
 
+    content = (resp.choices[0].message.content or "").strip()
     try:
-        payload = json.loads(resp.output_text)
+        payload = json.loads(content)
     except Exception:
-        raise HTTPException(status_code=502, detail="Model returned invalid JSON.")
+        raise HTTPException(status_code=502, detail=f"Model returned invalid JSON: {content[:200]}")
 
     # Ensure the 'type' matches the requested output type
     payload_type = payload.get("type")

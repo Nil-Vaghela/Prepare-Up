@@ -134,7 +134,7 @@ def chat(req: ChatRequest):
     )
 
     resp = _get_client().responses.create(
-        model="gpt-5-nano",  # keep consistent with generate.py; adjust if needed
+        model="gpt-5-nano-2025-08-07",  # keep consistent with generate.py; adjust if needed
         input=input_messages,
         text={
             "format": {
