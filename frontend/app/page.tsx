@@ -426,6 +426,7 @@ function Topbar() {
   const [loading, setLoading] = useState(false);
   const [gsiReady, setGsiReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showAuthMenu, setShowAuthMenu] = useState(false);
 
   const API_BASE =
     process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://localhost:8000";
@@ -488,6 +489,7 @@ function Topbar() {
 
   const handleGoogleLogin = async () => {
     setError(null);
+    setShowAuthMenu(false);
     // Google Identity Services is strict about the page origin matching the OAuth "Authorized JavaScript origins".
     // Safari can sometimes open localhost without the port or via a different host; fail fast with a clear fix.
     const origin = window.location.origin;
@@ -576,14 +578,82 @@ function Topbar() {
       <div className="tagline">Study Smarter not Harder</div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <button
-          className="btn"
-          onClick={handleGoogleLogin}
-          disabled={loading || !gsiReady}
-          title={!gsiReady ? "Loading Google Sign-In…" : ""}
-        >
-          {loading ? "Signing In…" : gsiReady ? "Sign In with Google" : "Loading…"}
-        </button>
+        <div style={{ position: "relative" }}>
+          <button
+            className="btn"
+            onClick={() =>
+              setShowAuthMenu((prev) => !prev)
+            }
+          >
+            Sign In
+          </button>
+
+          {showAuthMenu && (
+            <div
+              style={{
+                position: "absolute",
+                top: "110%",
+                right: 0,
+                minWidth: 220,
+                padding: 10,
+                borderRadius: 14,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "rgba(0,0,0,0.85)",
+                backdropFilter: "blur(12px)",
+                boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                zIndex: 10,
+              }}
+            >
+              <button
+                className="gsi-material-button"
+                onClick={handleGoogleLogin}
+                disabled={loading || !gsiReady}
+              >
+                <div className="gsi-material-button-state"></div>
+                <div className="gsi-material-button-content-wrapper">
+                  <div className="gsi-material-button-icon">
+                    <svg
+                      version="1.1"
+                      xmlns="http://www.w3.org/2000/svg"
+                      viewBox="0 0 48 48"
+                      style={{ display: "block" }}
+                    >
+                      <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                      <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                      <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                      <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+                    </svg>
+                  </div>
+                  <span className="gsi-material-button-contents">
+                    {loading
+                      ? "Signing In…"
+                      : gsiReady
+                      ? "Sign in with Google"
+                      : "Loading…"}
+                  </span>
+                  <span style={{ display: "none" }}>
+                    Sign in with Google
+                  </span>
+                </div>
+              </button>
+
+              <button
+                className="btn"
+                style={{
+                  width: "100%",
+                  opacity: 0.6,
+                  cursor: "not-allowed",
+                }}
+                disabled
+              >
+                Sign in with Apple (Coming Soon)
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {error ? (
@@ -1482,6 +1552,86 @@ function buildCss(t: Theme) {
 
     :global(html::-webkit-scrollbar-corner, body::-webkit-scrollbar-corner, *::-webkit-scrollbar-corner) {
       background: transparent !important;
+    }
+
+    /* ===== Google Official Button (material dark) ===== */
+    .gsi-material-button {
+      -webkit-user-select: none;
+      user-select: none;
+      background-color: #131314;
+      border: 1px solid #8e918f;
+      border-radius: 20px;
+      box-sizing: border-box;
+      color: #e3e3e3;
+      cursor: pointer;
+      font-family: 'Roboto', arial, sans-serif;
+      font-size: 14px;
+      height: 40px;
+      letter-spacing: 0.25px;
+      outline: none;
+      overflow: hidden;
+      padding: 0 14px;
+      position: relative;
+      text-align: center;
+      transition: background-color .218s, border-color .218s, box-shadow .218s;
+      width: 100%;
+      max-width: 400px;
+    }
+
+    .gsi-material-button .gsi-material-button-icon {
+      height: 20px;
+      margin-right: 10px;
+      min-width: 20px;
+      width: 20px;
+    }
+
+    .gsi-material-button .gsi-material-button-content-wrapper {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      width: 100%;
+    }
+
+    .gsi-material-button .gsi-material-button-contents {
+      flex-grow: 1;
+      font-weight: 500;
+      text-align: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .gsi-material-button .gsi-material-button-state {
+      transition: opacity .218s;
+      bottom: 0;
+      left: 0;
+      opacity: 0;
+      position: absolute;
+      right: 0;
+      top: 0;
+    }
+
+    .gsi-material-button:disabled {
+      cursor: default;
+      background-color: #13131461;
+      border-color: #8e918f1f;
+    }
+
+    .gsi-material-button:not(:disabled):active .gsi-material-button-state,
+    .gsi-material-button:not(:disabled):focus .gsi-material-button-state {
+      background-color: #ffffff;
+      opacity: 0.12;
+    }
+
+    .gsi-material-button:not(:disabled):hover {
+      box-shadow: 0 1px 2px 0 rgba(60,64,67,.30),
+                  0 1px 3px 1px rgba(60,64,67,.15);
+    }
+
+    .gsi-material-button:not(:disabled):hover .gsi-material-button-state {
+      background-color: #ffffff;
+      opacity: 0.08;
     }
   `;
 }
