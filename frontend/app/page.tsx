@@ -2,7 +2,12 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+declare global {
+  interface Window {
+    google?: any;
+  }
+}
 import * as THREE from "three";
 
 type Theme = {
@@ -145,8 +150,8 @@ export default function HomePage() {
     canvas.style.cssText = `
       position: fixed;
       inset: 0;
-      width: 100vw;
-      height: 100vh;
+      width: 100%;
+      height: 100%;
       z-index: 0;
       display: block;
       border: 0;
@@ -367,8 +372,8 @@ export default function HomePage() {
         window.innerHeight * ndpr
       );
 
-      renderer.domElement.style.width = "100vw";
-      renderer.domElement.style.height = "100vh";
+      renderer.domElement.style.width = "100%";
+      renderer.domElement.style.height = "100%";
       renderer.domElement.style.border = "0";
       renderer.domElement.style.outline = "0";
     };
@@ -418,13 +423,190 @@ export default function HomePage() {
 }
 
 function Topbar() {
+  const [loading, setLoading] = useState(false);
+  const [gsiReady, setGsiReady] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const API_BASE =
+    process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "http://localhost:8000";
+  const GOOGLE_CLIENT_ID =
+    process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID?.trim() || "";
+
+  const ALLOWED_ORIGINS = new Set([
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ]);
+
+  // Load Google Identity Services script once
+  useEffect(() => {
+    let cancelled = false;
+
+    const markReadyIfAvailable = () => {
+      if (cancelled) return;
+      if (window.google?.accounts?.id) setGsiReady(true);
+    };
+
+    // If already loaded
+    if (window.google?.accounts?.id) {
+      setGsiReady(true);
+      return;
+    }
+
+    // If script tag already exists, wait for it
+    const existing = document.querySelector<HTMLScriptElement>(
+      'script[src="https://accounts.google.com/gsi/client"]'
+    );
+    if (existing) {
+      existing.addEventListener("load", markReadyIfAvailable);
+      // in case it already loaded before listener attached
+      setTimeout(markReadyIfAvailable, 0);
+      return () => {
+        cancelled = true;
+        existing.removeEventListener("load", markReadyIfAvailable);
+      };
+    }
+
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = markReadyIfAvailable;
+    script.onerror = () => {
+      if (cancelled) return;
+      setError(
+        "Failed to load Google Sign-In. Disable ad-blockers and try again."
+      );
+    };
+    document.body.appendChild(script);
+
+    return () => {
+      cancelled = true;
+      script.onload = null;
+      script.onerror = null;
+    };
+  }, []);
+
+  const handleGoogleLogin = async () => {
+    setError(null);
+    // Google Identity Services is strict about the page origin matching the OAuth "Authorized JavaScript origins".
+    // Safari can sometimes open localhost without the port or via a different host; fail fast with a clear fix.
+    const origin = window.location.origin;
+    if (!ALLOWED_ORIGINS.has(origin)) {
+      setError(
+        `Google Sign-In blocked: this page is running at ${origin}. ` +
+          `Open http://localhost:3000 (or add ${origin} as an Authorized JavaScript origin in Google Cloud Console).`
+      );
+      return;
+    }
+
+
+
+    if (!GOOGLE_CLIENT_ID) {
+      setError(
+        "Missing NEXT_PUBLIC_GOOGLE_CLIENT_ID in frontend environment. Check docker-compose and rebuild."
+      );
+      return;
+    }
+
+    if (!window.google?.accounts?.id) {
+      setError("Google Sign-In not ready yet. Please try again in a second.");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      // Re-init each click is okay for now; later we can init once.
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        // Safari/non-Chrome can fail with FedCM prompts; force legacy behavior.
+        // This is safe and avoids Safari weirdness.
+        use_fedcm_for_prompt: false,
+        ux_mode: "popup",
+        cancel_on_tap_outside: false,
+        auto_select: false,
+        callback: async (response: any) => {
+          try {
+            const res = await fetch(`${API_BASE}/api/auth/google`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include", // ✅ Required for cross-origin cookies (Safari especially)
+              body: JSON.stringify({ id_token: response.credential }),
+            });
+
+            if (!res.ok) {
+              const txt = await res.text();
+              console.error("/api/auth/google failed:", res.status, txt);
+              setError(
+                `Login failed (${res.status}). ` +
+                  (txt?.slice(0, 180) || "Please try again.")
+              );
+              return;
+            }
+
+            const data = await res.json();
+
+            // Access token for API calls (refresh token stays HttpOnly cookie)
+            if (data?.access_token) {
+              localStorage.setItem("access_token", data.access_token);
+            }
+
+            window.location.href = "/dashboard";
+          } catch (e: any) {
+            console.error("Google login callback error:", e);
+            setError(e?.message || "Login failed. Please try again.");
+          } finally {
+            setLoading(false);
+          }
+        },
+      });
+
+      // Show the One Tap / prompt
+      window.google.accounts.id.prompt();
+    } catch (e: any) {
+      console.error("Google login init/prompt error:", e);
+      setError(e?.message || "Login failed. Please try again.");
+      setLoading(false);
+    }
+  };
+
   return (
     <header className="topbar">
       <div className="brand">Prepare-Up</div>
       <div className="tagline">Study Smarter not Harder</div>
-      <Link className="btn" href="/dashboard">
-        Sign In
-      </Link>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <button
+          className="btn"
+          onClick={handleGoogleLogin}
+          disabled={loading || !gsiReady}
+          title={!gsiReady ? "Loading Google Sign-In…" : ""}
+        >
+          {loading ? "Signing In…" : gsiReady ? "Sign In with Google" : "Loading…"}
+        </button>
+      </div>
+
+      {error ? (
+        <div
+          style={{
+            position: "absolute",
+            top: 58,
+            right: 20,
+            maxWidth: 420,
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "1px solid rgba(255,255,255,0.12)",
+            background: "rgba(0,0,0,0.65)",
+            color: "rgba(255,255,255,0.9)",
+            fontSize: 12,
+            fontWeight: 800,
+            zIndex: 5,
+          }}
+          role="alert"
+        >
+          {error}
+        </div>
+      ) : null}
     </header>
   );
 }
@@ -600,16 +782,34 @@ function buildCss(t: Theme) {
     /* ===== hard reset (prevents any white frame) ===== */
     :global(html, body) {
       height: 100%;
+      width: 100%;
       margin: 0 !important;
       padding: 0 !important;
-      background: ${t.bg};
+      background: ${t.bg} !important;
+      background-color: ${t.bg} !important;
       scroll-behavior: smooth;
       overflow-x: hidden;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior-y: none;
+      scrollbar-gutter: stable;
     }
     :global(body, #__next) {
       border: 0 !important;
       outline: 0 !important;
       box-shadow: none !important;
+      overflow-x: hidden !important;
+      width: 100%;
+      min-height: 100dvh;
+    }
+    :global(html) {
+      background-color: ${t.bg} !important;
+      min-height: 100%;
+    }
+
+    :global(body) {
+      background-color: ${t.bg} !important;
+      min-height: 100vh;
     }
     :global(*) { box-sizing: border-box; }
     :global(main, section) { border: 0; outline: 0; }
@@ -627,7 +827,15 @@ function buildCss(t: Theme) {
       --pu-border-hover: ${t.borderHover};
     }
 
-    .pu-bg { position: fixed; inset: 0; z-index: 0; background: var(--pu-bg); }
+    .pu-bg {
+      position: fixed;
+      inset: 0;
+      z-index: 0;
+      width: 100%;
+      height: 100%;
+      min-height: 100vh;
+      background: var(--pu-bg);
+    }
     .pu-vignette {
       position: fixed;
       inset: 0;
@@ -638,8 +846,8 @@ function buildCss(t: Theme) {
 
     .pu-home {
       position: relative;
-      min-height: 100vh;
-      width: 100vw;
+      min-height: 100dvh;
+      width: 100%;
       color: var(--pu-text);
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
         "Apple Color Emoji", "Segoe UI Emoji";
@@ -1087,7 +1295,7 @@ function buildCss(t: Theme) {
     .footer {
       position: relative;
       z-index: 2;
-      width: 100vw;
+      width: 100%;
       margin: 0;
       padding: 0;
       background: linear-gradient(180deg, rgba(0,0,0,0.00), rgba(0,0,0,0.25));
@@ -1239,6 +1447,41 @@ function buildCss(t: Theme) {
       .footerInner { padding: 36px 16px 22px; }
       .footerTop { grid-template-columns: 1fr; }
       .footerBottom { flex-direction: column; align-items: flex-start; }
+    }
+    
+
+    /* ===== Scrollbars: hide everywhere (still scrollable) =====
+       Note: macOS overlay scrollbars may still flash while scrolling depending on OS settings.
+    ===== */
+    :global(html, body) {
+      -ms-overflow-style: none;   /* IE/Edge legacy */
+      scrollbar-width: none;      /* Firefox */
+      overflow-y: hidden;
+    }
+
+    /* Firefox: hide on all scroll containers */
+    :global(*) {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+
+    /* WebKit (Chrome/Safari): hide on html/body + all scroll containers */
+    :global(html::-webkit-scrollbar, body::-webkit-scrollbar, *::-webkit-scrollbar) {
+      width: 0 !important;
+      height: 0 !important;
+    }
+
+    :global(html::-webkit-scrollbar-track, body::-webkit-scrollbar-track, *::-webkit-scrollbar-track) {
+      background: transparent !important;
+    }
+
+    :global(html::-webkit-scrollbar-thumb, body::-webkit-scrollbar-thumb, *::-webkit-scrollbar-thumb) {
+      background: transparent !important;
+      border: 0 !important;
+    }
+
+    :global(html::-webkit-scrollbar-corner, body::-webkit-scrollbar-corner, *::-webkit-scrollbar-corner) {
+      background: transparent !important;
     }
   `;
 }
