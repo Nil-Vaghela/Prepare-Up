@@ -1,7 +1,6 @@
-
-
 from __future__ import annotations
 
+import os
 import json
 import time
 from pathlib import Path
@@ -15,10 +14,10 @@ router = APIRouter()
 
 
 def _get_client() -> OpenAI:
-    try:
-        return OpenAI()
-    except Exception:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in the backend environment.")
+    return OpenAI(api_key=api_key)
 
 TMP_DIR = Path("/tmp/prepareup_sessions")
 SESSION_TTL_SECONDS = 60 * 30  # 30 minutes; keep consistent with upload/generate
@@ -71,6 +70,8 @@ def chat(req: ChatRequest):
 
     # Keep only the most recent turns to avoid token blowups.
     history = req.history or []
+    # Defensive: drop any malformed turns
+    history = [t for t in history if getattr(t, "role", None) in ("user", "ai") and getattr(t, "content", "").strip()]
     history = history[-12:]
 
     # Strong grounding rules: only answer from the uploaded docs, with limited outside knowledge for clarification.
@@ -87,34 +88,20 @@ def chat(req: ChatRequest):
         "6) When the user asks to modify a previous output (study guide/flashcards/podcast/script), apply the modification but keep it faithful to the DOCUMENTS; any additions beyond the documents must be explicitly labeled as General knowledge."
     )
 
-    # Structured output for predictable UI.
-    schema = {
-        "name": "chat_answer_schema",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "type": {"type": "string", "enum": ["chat"]},
-                "answer": {"type": "string"},
-            },
-            "required": ["type", "answer"],
-            "additionalProperties": False,
-        },
-    }
-
     # Build model input.
-    input_messages = [{"role": "system", "content": system_prompt}]
-
-    # Provide documents once per request.
-    input_messages.append(
+    input_messages = [
+        {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
+                "Return ONLY valid JSON. No extra text.\n\n"
+                "You MUST respond with a JSON object of the form: {\"type\":\"chat\",\"answer\":\"...\"}.\n\n"
                 "DOCUMENTS (use as the only source):\n"
                 f"{corpus}\n\n"
                 "Conversation so far (may reference outputs you generated):"
             ),
-        }
-    )
+        },
+    ]
 
     # Add short history (map ai->assistant for the model).
     for t in history:
@@ -133,21 +120,32 @@ def chat(req: ChatRequest):
         }
     )
 
-    resp = _get_client().responses.create(
-        model="gpt-5-nano-2025-08-07",  # keep consistent with generate.py; adjust if needed
-        input=input_messages,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": schema["name"],
-                "schema": schema["schema"],
-            }
-        },
+    model_name = os.getenv("OPENAI_CHAT_MODEL", os.getenv("OPENAI_MODEL", "gpt-5-nano"))
+
+    resp = _get_client().chat.completions.create(
+        model=model_name,
+        messages=input_messages,
+        response_format={"type": "json_object"},
     )
 
+    content = (resp.choices[0].message.content or "").strip()
     try:
-        payload = json.loads(resp.output_text)
+        payload = json.loads(content)
     except Exception:
-        raise HTTPException(status_code=502, detail="Model returned invalid JSON.")
+        raise HTTPException(status_code=502, detail=f"Model returned invalid JSON: {content[:500]}")
+
+    # Normalize payload shape
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Model returned non-object JSON.")
+
+    if payload.get("type") != "chat":
+        payload["type"] = "chat"
+
+    if "answer" not in payload:
+        # Accept legacy keys
+        payload["answer"] = payload.get("text") or payload.get("message") or ""
+
+    if not str(payload.get("answer", "")).strip():
+        raise HTTPException(status_code=502, detail="Model returned empty answer.")
 
     return payload
