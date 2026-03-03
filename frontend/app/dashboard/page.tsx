@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import * as THREE from "three";
 
 type DiscordConnectState = "idle" | "connecting" | "connected" | "error";
@@ -40,6 +41,28 @@ type ChatSession = {
   messages: ChatMessage[];
 };
 
+type UserProfile = {
+  id?: string | null;
+  email?: string | null;
+  name?: string | null;
+  avatar_url?: string | null;
+};
+
+type GoogleAccounts = {
+  id?: {
+    initialize?: (opts: { client_id: string; callback: (res: { credential?: string }) => void }) => void;
+    renderButton?: (el: HTMLElement, opts: Record<string, unknown>) => void;
+    prompt?: () => void;
+    disableAutoSelect?: () => void;
+  };
+};
+
+declare global {
+  interface Window {
+    google?: { accounts?: GoogleAccounts };
+  }
+}
+
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
   const k = 1024;
@@ -55,6 +78,12 @@ function isAllowed(file: File) {
 
 export default function DashboardPage() {
   // Sidebar is NOT a router. It only offers generation modes.
+  // Helper to build Authorization headers if accessToken exists
+  const authHeaders = () => {
+    const h: Record<string, string> = {};
+    if (accessToken) h.Authorization = `Bearer ${accessToken}`;
+    return h;
+  };
   const [sidebarActive, setSidebarActive] = useState<"flash_cards" | "podcast" | "mock_test" | "study_guide" | null>(
     null
   );
@@ -124,13 +153,43 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
+    // Auth
   const [accessToken, setAccessToken] = useState<string | null>(null);
-  const isAnonymous = !accessToken;
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState<string>("");
+  const [gsiReady, setGsiReady] = useState(false); 
+
+  const [authMenuOpen, setAuthMenuOpen] = useState(false);
+  const [authMenuPos, setAuthMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const authMenuRef = useRef<HTMLDivElement | null>(null);
+  const signInBtnRef = useRef<HTMLButtonElement | null>(null);
+  const userChipRef = useRef<HTMLDivElement | null>(null);
+  const userMenuRef = useRef<HTMLDivElement | null>(null);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [userMenuPos, setUserMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const gsiBtnMountRef = useRef<HTMLDivElement | null>(null);
+
+  const isAnonymous = !(userProfile && (userProfile.id || userProfile.email));
   const chatListRef = useRef<HTMLDivElement | null>(null);
   // Real chat threads (created when the user uploads / starts chatting)
   const [recentQuery, setRecentQuery] = useState("");
   const [recentVisible, setRecentVisible] = useState(12);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
+  const [chatsHydrated, setChatsHydrated] = useState(false);
+
+
+  useEffect(() => {
+  if (!chatsHydrated) return;
+
+  const id = activeChatIdRef.current;
+  if (!id) return;
+  if (!chatSessions.length) return;
+
+  const exists = chatSessions.some((s) => s.id === id);
+  if (exists) openChatThread(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [chatsHydrated, chatSessions]);
 
   // Hydration-safe "now" timestamp: null on SSR + first client render, then set after mount.
   const [nowTs, setNowTs] = useState<number | null>(null);
@@ -287,6 +346,342 @@ export default function DashboardPage() {
   // Discord integration
   // -----------------------------
   const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
+
+  const getGreeting = () => {
+    const h = new Date().getHours();
+    if (h < 12) return "Good morning";
+    if (h < 18) return "Good afternoon";
+    return "Good evening";
+  };
+
+  const getDisplayName = () => {
+    const name = userProfile?.name?.trim();
+    if (name) return name;
+
+    const email = userProfile?.email?.trim();
+    if (email) {
+      const base = email.split("@")[0] || "";
+      return base || "Unknown";
+    }
+
+    return "Unknown";
+  };
+
+  const getAvatarInitial = () => {
+    const s = (userProfile?.name || userProfile?.email || "U").trim();
+    return (s[0] || "U").toUpperCase();
+  };
+
+  const refreshMe = async (opts?: { allowFail?: boolean }) => {
+    const allowFail = !!opts?.allowFail;
+
+    try {
+      const headers: Record<string, string> = {};
+      if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+
+      const res = await fetch(`${BACKEND_BASE}/api/auth/me`, {
+        credentials: "include",
+        headers,
+      });
+
+      if (!res.ok) {
+        // Do not wipe UI state on a 401 right after login.
+        // Only clear if we're strict AND we truly have no auth.
+        if (!allowFail && !accessToken) {
+          setUserProfile(null);
+          setAccessToken(null);
+        }
+        return;
+      }
+
+      const data = await res.json();
+      const profile: UserProfile | null = data?.user || data?.profile || null;
+
+      if (profile) setUserProfile(profile);
+      if (typeof data?.access_token === "string") setAccessToken(data.access_token);
+
+      // Persist if present
+      try {
+        if (profile) window.localStorage.setItem("pu_user_profile", JSON.stringify(profile));
+        if (typeof data?.access_token === "string") window.localStorage.setItem("pu_access_token", data.access_token);
+      } catch {
+        // ignore
+      }
+    } catch {
+      if (!allowFail && !accessToken) {
+        setUserProfile(null);
+        setAccessToken(null);
+      }
+    }
+  };
+
+  const claimAnonymousChatIfSupported = async (token: string) => {
+    if (!chatSessions.length) return;
+    try {
+      await fetch(`${BACKEND_BASE}/api/chat/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        credentials: "include",
+        body: JSON.stringify({ threads: chatSessions, active_id: activeChatIdRef.current }),
+      });
+    } catch {
+      // ignore: endpoint may not exist yet
+    }
+  };
+
+  const completeLogin = async (idToken: string) => {
+    if (!idToken) return;
+    setAuthLoading(true);
+    setAuthError("");
+
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/auth/google`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ id_token: idToken, idToken }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Google login failed");
+      }
+
+      const data = await res.json();
+      const token = typeof data?.access_token === "string" ? data.access_token : null;
+      const profile: UserProfile | null = data?.user || data?.profile || null;
+
+      // Fallback: if backend doesn't provide name/avatar, decode from the Google id_token
+      let mergedProfile: UserProfile | null = profile;
+      try {
+        const parts = idToken.split(".");
+        if (parts.length === 3) {
+          const payloadJson = atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"));
+          const payload = JSON.parse(payloadJson);
+
+          const name = typeof payload?.name === "string" ? payload.name : null;
+          const email = typeof payload?.email === "string" ? payload.email : null;
+          const avatar_url = typeof payload?.picture === "string" ? payload.picture : null;
+
+          mergedProfile = {
+            ...(profile || {}),
+            name: (profile?.name || name) ?? null,
+            email: (profile?.email || email) ?? null,
+            avatar_url: (profile?.avatar_url || avatar_url) ?? null,
+          };
+        }
+      } catch {
+        // ignore
+      }
+
+      if (token) setAccessToken(token);
+      setUserProfile(mergedProfile);
+      setAuthMenuOpen(false);
+
+      // Persist if present
+      try {
+        if (mergedProfile) window.localStorage.setItem("pu_user_profile", JSON.stringify(mergedProfile));
+        if (typeof data?.access_token === "string") window.localStorage.setItem("pu_access_token", data.access_token);
+      } catch {
+        // ignore
+      }
+
+      await refreshMe({ allowFail: true });
+      if (token) await claimAnonymousChatIfSupported(token);
+
+      // One-time greeting message
+      // Only inject into an existing thread (avoid creating a junk "New chat" when user logs in before uploading).
+      const name = mergedProfile?.name || mergedProfile?.email || "there";
+      const hasThread = chatSessions.length > 0 || !!activeChatIdRef.current;
+      const hasContext = uploaded.length > 0 || !!sessionId || messages.length > 0;
+
+      if (hasThread || hasContext) {
+        setMessages((prev) => {
+          const already = prev.some((m) => m.role === "ai" && m.title === "Welcome back");
+          if (already) return prev;
+          const next = [
+            ...prev,
+            {
+              id: crypto.randomUUID(),
+              role: "ai",
+              title: "Welcome back",
+              text: `Hi ${name}! You’re signed in — your chats can now be saved.`,
+            } as ChatMessage,
+          ];
+          upsertActiveSession({ messages: next });
+          return next;
+        });
+      }
+    } catch (e: any) {
+      setAuthError(e?.message || "Google login failed");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const ensureGsiLoaded = async () => {
+    if (typeof window === "undefined") return;
+    if (!GOOGLE_CLIENT_ID) return;
+
+    if (window.google?.accounts?.id) {
+      setGsiReady(true);
+      return;
+    }
+
+    const existing = document.querySelector('script[data-pu-gsi="1"]') as HTMLScriptElement | null;
+    if (existing) return;
+
+    await new Promise<void>((resolve) => {
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.async = true;
+      s.defer = true;
+      s.setAttribute("data-pu-gsi", "1");
+      s.onload = () => resolve();
+      s.onerror = () => resolve();
+      document.head.appendChild(s);
+    });
+
+    if (window.google?.accounts?.id) setGsiReady(true);
+  };
+
+  const renderGsiButton = () => {
+    if (!GOOGLE_CLIENT_ID) return;
+    if (!gsiBtnMountRef.current) return;
+
+    const idApi = window.google?.accounts?.id;
+    if (!idApi?.initialize || !idApi?.renderButton) return;
+
+    gsiBtnMountRef.current.innerHTML = "";
+
+    idApi.initialize({
+      client_id: GOOGLE_CLIENT_ID,
+      callback: (res: { credential: string; }) => {
+        const cred = res?.credential || "";
+        void completeLogin(cred);
+      },
+    });
+
+    idApi.renderButton(gsiBtnMountRef.current, {
+      theme: "outline",
+      size: "large",
+      type: "standard",
+      text: "signin_with",
+      shape: "pill",
+      width: 300,
+    });
+  };
+
+  useEffect(() => {
+    try {
+      const tok = localStorage.getItem("pu_access_token");
+      if (tok) setAccessToken(tok);
+
+      const p = localStorage.getItem("pu_user_profile");
+      if (p) setUserProfile(JSON.parse(p));
+    } catch {}
+
+    void refreshMe({ allowFail: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    void ensureGsiLoaded();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [GOOGLE_CLIENT_ID]);
+
+  useEffect(() => {
+    if (!authMenuOpen) return;
+    if (!gsiReady) return;
+    const t = window.setTimeout(() => renderGsiButton(), 0);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authMenuOpen, gsiReady]);
+
+  useEffect(() => {
+    if (!authMenuOpen) return;
+
+    const onDown = (e: MouseEvent) => {
+      const m = authMenuRef.current;
+      const b = signInBtnRef.current;
+      if (!m) return;
+      const t = e.target as Node;
+      if (m.contains(t)) return;
+      if (b && b.contains(t)) return;
+      setAuthMenuOpen(false);
+    };
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setAuthMenuOpen(false);
+    };
+
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [authMenuOpen]);
+
+  useEffect(() => {
+    if (!chatsHydrated) return;
+    try {
+      window.localStorage.setItem("pu_chat_sessions", JSON.stringify(chatSessions));
+      window.localStorage.setItem("pu_active_chat_id", activeChatIdRef.current || "");
+    } catch {
+      // ignore
+    }
+  }, [chatSessions, chatsHydrated]);
+
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem("pu_chat_sessions");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setChatSessions(parsed);
+      }
+
+      const aid = window.localStorage.getItem("pu_active_chat_id") || "";
+      if (aid) setActiveChatIdSync(aid);
+    } catch {
+      // ignore
+    } finally {
+      // Critical: do not overwrite localStorage until we've attempted restore.
+      setChatsHydrated(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const onSignOut = async () => {
+    setAuthLoading(true);
+    setAuthError("");
+
+    try {
+      await fetch(`${BACKEND_BASE}/api/auth/logout`, { method: "POST", credentials: "include" });
+    } catch {
+      // ignore
+    } finally {
+      try {
+        window.google?.accounts?.id?.disableAutoSelect?.();
+      } catch {
+        // ignore
+      }
+
+      try {
+        window.localStorage.removeItem("pu_access_token");
+        window.localStorage.removeItem("pu_user_profile");
+      } catch {
+        // ignore
+      }
+
+      setUserProfile(null);
+      setAccessToken(null);
+      setAuthMenuOpen(false);
+      setAuthLoading(false);
+      void refreshMe({ allowFail: true });
+    }
+  };
   const DISCORD_CONNECT_URL =
     process.env.NEXT_PUBLIC_DISCORD_CONNECT_URL || `${BACKEND_BASE}/api/auth/discord`;
 
@@ -823,6 +1218,9 @@ export default function DashboardPage() {
         method: "POST",
         body: form,
         credentials: "include",
+        headers: {
+          ...authHeaders(),
+        },
       });
       if (!res.ok) {
         const msg = await res.text();
@@ -959,7 +1357,7 @@ export default function DashboardPage() {
   const onSelectOutput = async (k: OutputType) => {
     if (generating) return;
     if (!sessionId) {
-      alert("Upload is not ready yet. Please upload files first.");
+      alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
       return;
     }
     setSelectedOutput(k);
@@ -990,7 +1388,7 @@ export default function DashboardPage() {
     try {
       const res = await fetch(`${BACKEND_BASE}/api/generate`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
         body: JSON.stringify({
           session_id: sessionId,
@@ -1044,7 +1442,7 @@ export default function DashboardPage() {
     const text = chatInput.trim();
     if (!text || generating) return;
     if (!sessionId) {
-      alert("Upload is not ready yet. Please upload files first.");
+      alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
       return;
     }
 
@@ -1065,16 +1463,17 @@ export default function DashboardPage() {
     try {
       const res = await fetch(`${BACKEND_BASE}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
         body: JSON.stringify({
           session_id: sessionId,
           message: text,
           history: messages
             .filter((m) => !m.loading)
+            .filter((m) => m.role === "user" || m.role === "ai")
             .slice(-12)
             .map((m) => ({
-              role: m.role, // "user" | "ai" (matches backend)
+              role: m.role, // backend expects "user" | "ai"
               content: [m.title, m.meta, m.text].filter(Boolean).join("\n"),
             })),
         }),
@@ -1919,6 +2318,59 @@ export default function DashboardPage() {
           place-items: center;
           transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
         }
+        .pu-authMenu {
+          pointer-events: auto;
+        }
+
+        .pu-avatarImg {
+          width: 30px;
+          height: 30px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          object-fit: cover;
+          display: block;
+        }
+
+        :global(.g_id_signin) {
+          width: 100% !important;
+          display: flex !important;
+          justify-content: center !important;
+        }
+
+        :global(.gsi-material-button.disabled) {
+          opacity: 0.55;
+          cursor: not-allowed;
+        }
+
+        :global(.gsi-material-button) {
+          width: 100%;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          height: 44px;
+          padding: 0 14px;
+          border-radius: 999px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.92);
+          font-size: 12px;
+          font-weight: 900;
+        }
+
+        :global(.gsi-material-button-content-wrapper) {
+          display: inline-flex;
+          align-items: center;
+          gap: 10px;
+        }
+
+        :global(.gsi-material-button-icon) {
+          width: 18px;
+          height: 18px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
 
         .pu-send:hover {
           transform: translateY(-1px);
@@ -2031,15 +2483,126 @@ export default function DashboardPage() {
         {/* Main */}
         <main className="pu-glass pu-main">
           <div className="pu-topbar">
-            <div />
-            <div className="pu-userChip">
-              <div className="pu-avatar">N</div>
-              <div>
-                <div className="pu-userHint">Good morning</div>
-                <div className="pu-userName">Nil Vaghela</div>
+          <div />
+
+          {isAnonymous ? (
+            <div style={{ position: "relative", display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
+                <div style={{ fontSize: 11, fontWeight: 900, color: "rgba(255,255,255,0.62)" }}>
+                  You’re chatting as a guest
+                </div>
+
+                <button
+                  ref={signInBtnRef}
+                  className={`pu-btn pu-btnPrimary ${authLoading ? "pu-btnDisabled" : ""}`}
+                  type="button"
+                  onClick={() => {
+                    setAuthMenuOpen((v) => {
+                      const next = !v;
+                      if (next && signInBtnRef.current) {
+                        const r = signInBtnRef.current.getBoundingClientRect();
+                        const width = 340;
+                        const pad = 12;
+                        const top = Math.round(r.bottom + 10);
+                        const left = Math.min(window.innerWidth - width - pad, Math.max(pad, Math.round(r.right - width)));
+                        setAuthMenuPos({ top, left });
+                      }
+                      return next;
+                    });
+                  }}
+                  disabled={authLoading || !GOOGLE_CLIENT_ID}
+                  suppressHydrationWarning
+                  aria-haspopup="dialog"
+                  aria-expanded={authMenuOpen}
+                  title={!GOOGLE_CLIENT_ID ? "Missing NEXT_PUBLIC_GOOGLE_CLIENT_ID" : ""}
+                >
+                  {authLoading ? "Signing in…" : "Sign in"}
+                </button>
               </div>
+
+              {authMenuOpen && typeof document !== "undefined"
+                ? createPortal(
+                    <div
+                      ref={authMenuRef}
+                      className="pu-authMenu"
+                      style={{
+                        position: "fixed",
+                        top: authMenuPos?.top ?? 70,
+                        left: authMenuPos?.left ?? Math.max(12, window.innerWidth - 340 - 12),
+                        width: 340,
+                        padding: 12,
+                        borderRadius: 16,
+                        border: "1px solid rgba(255,255,255,0.12)",
+                        background: "rgba(10,12,18,0.78)",
+                        backdropFilter: "blur(14px) saturate(140%)",
+                        WebkitBackdropFilter: "blur(14px) saturate(140%)",
+                        boxShadow: "0 18px 60px rgba(0,0,0,0.46)",
+                        zIndex: 2147483000,
+                        pointerEvents: "auto",
+                      }}
+                      role="dialog"
+                      aria-label="Sign in options"
+                    >
+                      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                        <div style={{ fontSize: 12, fontWeight: 900, color: "rgba(255,255,255,0.88)" }}>
+                          Sign in to save chats
+                        </div>
+
+                        {!GOOGLE_CLIENT_ID ? (
+                          <div style={{ fontSize: 12, color: "rgba(255,120,120,0.95)" }}>
+                            Missing NEXT_PUBLIC_GOOGLE_CLIENT_ID in your frontend environment.
+                          </div>
+                        ) : !gsiReady ? (
+                          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.72)" }}>Loading Google Sign-In…</div>
+                        ) : (
+                          <div ref={gsiBtnMountRef} />
+                        )}
+
+                        <button className="gsi-material-button disabled" type="button" disabled aria-label="Sign in with Apple">
+                          <div className="gsi-material-button-content-wrapper">
+                            <div className="gsi-material-button-icon" aria-hidden="true">
+                              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="20" height="20" fill="#e3e3e3">
+                                <path d="M16.365 1.43c0 1.14-.42 2.2-1.26 3.16-.93 1.05-2.52 1.86-3.84 1.75-.16-1.24.44-2.58 1.3-3.55.94-1.06 2.58-1.82 3.8-1.36z" />
+                                <path d="M20.4 17.2c-.52 1.2-1.14 2.29-1.96 3.38-1.11 1.48-2.02 2.5-3.51 2.52-1.46.02-1.93-.86-3.6-.86-1.67 0-2.18.84-3.56.88-1.44.05-2.54-1.15-3.66-2.62-2.24-2.93-3.95-8.27-1.65-11.87 1.14-1.77 3.19-2.9 5.42-2.93 1.42-.03 2.77.96 3.6.96.82 0 2.37-1.18 4-1.01.68.03 2.6.27 3.83 2.05-.1.06-2.28 1.33-2.26 3.97.02 3.15 2.76 4.2 2.79 4.21z" />
+                              </svg>
+                            </div>
+                            <span className="gsi-material-button-contents">Sign in with Apple (soon)</span>
+                          </div>
+                        </button>
+
+                        {authError ? (
+                          <div style={{ fontSize: 12, lineHeight: 1.4, color: "rgba(255,120,120,0.95)", whiteSpace: "pre-wrap" }}>
+                            {authError}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>,
+                    document.body
+                  )
+                : null}
             </div>
-          </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+                <div className="pu-userHint">{getGreeting()}</div>
+                <div className="pu-userName">{getDisplayName()}</div>
+              </div>
+
+              <div className="pu-userChip" aria-label="Signed in user">
+                {userProfile?.avatar_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img className="pu-avatarImg" src={userProfile.avatar_url} alt="" />
+                ) : (
+                  <div className="pu-avatar">{getAvatarInitial()}</div>
+                )}
+              </div>
+
+              <button className="pu-btn" type="button" onClick={onSignOut} disabled={authLoading}>
+                Sign out
+              </button>
+            </div>
+          )}
+        </div>
 
           <div
             className="pu-content"
