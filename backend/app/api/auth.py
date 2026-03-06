@@ -60,6 +60,7 @@ class UserOut(BaseModel):
     id: str
     display_name: str | None = None
     avatar_url: str | None = None
+    email: str | None = None
 
 
 class LoginResponse(BaseModel):
@@ -99,11 +100,11 @@ async def login_with_google(
 
     # Set refresh token as HttpOnly cookie (7 days)
     response.set_cookie(
-        key="refresh_token",
+        key="pu_refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=False,  # True in production (HTTPS)
-        samesite="lax",
+        secure=False,      # localhost http
+        samesite="lax",    # ok for localhost + same-site requests
         max_age=7 * 24 * 60 * 60,
         path="/",
     )
@@ -114,31 +115,25 @@ async def login_with_google(
             id=str(user.get("id")),
             display_name=user.get("name"),
             avatar_url=user.get("avatar_url"),
+            email=user.get("email"),
         ),
     )
 
 
-@router.get("/auth/me", response_model=UserOut)
+@router.get("/auth/me")
 async def me(
     request: Request,
     db: Session = Depends(get_db),
 ):
-    """Return the current logged-in user.
-
-    We support two ways:
-    1) Authorization: Bearer <access_token>
-    2) refresh_token HttpOnly cookie (used by the frontend with credentials: 'include')
-
-    For Sprint 2, we keep this minimal: decode token, read user_id from `sub`, return user.
     """
-
-    token = _extract_bearer_token(request) or request.cookies.get("refresh_token")
+    Return current user. Works after refresh using HttpOnly cookie.
+    Also returns a fresh access_token when using cookie auth.
+    """
+    token = _extract_bearer_token(request) or request.cookies.get("pu_refresh_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     payload = _decode_token(token)
-
-    # We expect JWT to contain `sub` = user_id (uuid string)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token: missing subject")
@@ -147,18 +142,47 @@ async def me(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    return UserOut(
-        id=str(user.id),
-        display_name=getattr(user, "display_name", None),
-        avatar_url=getattr(user, "avatar_url", None),
-    )
+    # if request came from cookie (no bearer), mint a short-lived access token
+    fresh_access = None
+    if _extract_bearer_token(request) is None and request.cookies.get("pu_refresh_token"):
+        # simple access token = JWT signed with same secret; 15 min TTL
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        exp = now + timedelta(minutes=int(os.getenv("ACCESS_TOKEN_TTL_MIN", "15")))
+        fresh_access = jwt.encode(
+            {"sub": str(user.id), "iat": int(now.timestamp()), "exp": int(exp.timestamp())},
+            _jwt_secret(),
+            algorithm=_jwt_alg(),
+        )
+
+    return {
+        "user": {
+            "id": str(user.id),
+            "display_name": getattr(user, "display_name", None),
+            "avatar_url": getattr(user, "avatar_url", None),
+            "email": getattr(user, "email", None),
+        },
+        "access_token": fresh_access,
+        "token_type": "bearer",
+    }
 
 
 @router.post("/auth/refresh")
 async def refresh(request: Request):
     raise HTTPException(status_code=501, detail="Not implemented yet (Task 90).")
 
-
 @router.post("/auth/logout")
-async def logout(request: Request):
-    raise HTTPException(status_code=501, detail="Not implemented yet (Task 92).")
+async def logout(response: Response):
+    response.delete_cookie(key="pu_refresh_token", path="/")
+    # Extra safety: some browsers require matching attributes to reliably clear
+    response.set_cookie(
+        key="pu_refresh_token",
+        value="",
+        httponly=True,
+        secure=False,  # True in production (HTTPS)
+        samesite="lax",
+        max_age=0,
+        path="/",
+    )
+    return {"ok": True}

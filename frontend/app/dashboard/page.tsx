@@ -32,7 +32,7 @@ type ChatSession = {
   title: string;
   updatedAt: number;
 
-  backendSessionId: string | null; // from /api/upload
+  backendSessionId: string | null; // from /api/upload or persisted DB source session
 
   uploaded: UploadedFile[];
   combinedTextLen: number;
@@ -103,20 +103,17 @@ export default function DashboardPage() {
     // setSidebarActive(key);
 
     if (key === "flash_cards") {
-      setSelectedOutput("flash_card");
-      // upsertActiveSession({ selectedOutput: "flash_card" }); // removed per instructions
+      void onSelectOutput("flash_card");
       return;
     }
 
     if (key === "podcast") {
-      setSelectedOutput("podcast");
-      // upsertActiveSession({ selectedOutput: "podcast" }); // removed per instructions
+      void onSelectOutput("podcast");
       return;
     }
 
     if (key === "study_guide") {
-      setSelectedOutput("study_guide");
-      // upsertActiveSession({ selectedOutput: "study_guide" }); // removed per instructions
+      void onSelectOutput("study_guide");
       return;
     }
 
@@ -187,7 +184,7 @@ export default function DashboardPage() {
   if (!chatSessions.length) return;
 
   const exists = chatSessions.some((s) => s.id === id);
-  if (exists) openChatThread(id);
+  if (exists) void openChatThread(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [chatsHydrated, chatSessions]);
 
@@ -203,6 +200,13 @@ export default function DashboardPage() {
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const activeChatIdRef = useRef<string | null>(null);
 
+  const activeSession = useMemo(
+  () => chatSessions.find((s) => s.id === activeChatId) ?? null,
+  [chatSessions, activeChatId]
+  );
+
+  const effectiveSessionId = sessionId || activeSession?.backendSessionId || null;
+  const canChatInCurrentThread = !!effectiveSessionId;
   const setActiveChatIdSync = (id: string | null) => {
     activeChatIdRef.current = id;
     setActiveChatId(id);
@@ -262,17 +266,176 @@ export default function DashboardPage() {
     setRecentQuery("");
     setRecentVisible(12);
   };
+  const loadThreadMessages = async (threadId: string) => {
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/chat/threads/${encodeURIComponent(threadId)}`, {
+        credentials: "include",
+        headers: {
+          ...authHeaders(),
+        },
+      });
 
-  const openChatThread = (id: string) => {
+      if (!res.ok) return null;
+
+      const data = await res.json();
+      const msgs = Array.isArray(data?.messages) ? data.messages : [];
+      const sourceFiles = Array.isArray(data?.thread?.source_files) ? data.thread.source_files : [];
+
+      const mapped: ChatMessage[] = msgs.map((m: any) => {
+      const raw = typeof m?.content === "string" ? m.content : "";
+      const parts = raw.split("\n");
+      const first = (parts[0] || "").trim();
+      const second = (parts[1] || "").trim();
+      const rest = parts.slice(2).join("\n").trim();
+
+      if (m?.role === "ai" && first === "Welcome" && second.startsWith("Sources:")) {
+        return {
+          id: typeof m?.id === "string" ? m.id : crypto.randomUUID(),
+          role: "ai",
+          title: first,
+          meta: second,
+          text: rest || "Pick an output above to generate first. After that, use the chat bar to refine it.",
+        };
+      }
+
+      return {
+        id: typeof m?.id === "string" ? m.id : crypto.randomUUID(),
+        role: m?.role === "ai" ? "ai" : "user",
+        text: raw,
+      };
+    });
+
+      const normalizedUploaded: UploadedFile[] = sourceFiles.map((f: any) => ({
+        id: typeof f?.id === "string" ? f.id : crypto.randomUUID(),
+        name: typeof f?.name === "string" ? f.name : "unknown",
+        status: typeof f?.status === "string" ? f.status : "extracted",
+        textLen: typeof f?.textLen === "number" ? f.textLen : typeof f?.text_len === "number" ? f.text_len : 0,
+      }));
+
+      const title =
+        typeof data?.thread?.title === "string" && data.thread.title.trim() ? data.thread.title.trim() : "Chat";
+
+      const backendSessionId =
+        typeof data?.thread?.source_session_id === "string" && data.thread.source_session_id.trim()
+          ? data.thread.source_session_id.trim()
+          : null;
+
+      const combinedTextLen =
+        typeof data?.thread?.combined_text_len === "number" ? data.thread.combined_text_len : 0;
+
+      return {
+        title,
+        messages: mapped,
+        backendSessionId,
+        uploaded: normalizedUploaded,
+        combinedTextLen,
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const persistThreadSnapshot = async (opts?: {
+    forceThreadId?: string | null;
+    forceTitle?: string | null;
+    forceMessages?: ChatMessage[];
+  }) => {
+    const resolvedSessionId = effectiveSessionId;
+    if (!resolvedSessionId) return null;
+
+    const sourceMessages = opts?.forceMessages ?? messages;
+
+    // Persist only real, non-loading messages
+    const snapshot = sourceMessages
+      .filter((m) => !m.loading)
+      .filter((m) => m.role === "user" || m.role === "ai")
+      .map((m) => ({
+        role: m.role,
+        content: [m.title, m.meta, m.text].filter(Boolean).join("\n"),
+      }))
+      .filter((m) => m.content.trim().length > 0);
+
+    // If nothing to save, bail
+    if (snapshot.length === 0) return null;
+
+    const threadId = (opts?.forceThreadId ?? activeChatIdRef.current) || null;
+    const title =
+      (opts?.forceTitle ?? (uploaded?.[0]?.name ? uploaded[0].name : "Chat")) || "Chat";
+
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/chat/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
+        body: JSON.stringify({
+          session_id: resolvedSessionId,
+          thread_id: threadId,
+          thread_title: title,
+          messages: snapshot,
+          source_session_id: resolvedSessionId,
+          source_files: uploaded,
+          combined_text_len: combinedTextLen,
+        }),
+      });
+
+      if (!res.ok) return null;
+      const data = await res.json();
+      const backendThreadId = typeof data?.thread_id === "string" ? data.thread_id : null;
+      return backendThreadId;
+    } catch {
+      return null;
+    }
+  };
+
+  const openChatThread = async (id: string) => {
     const s = chatSessions.find((x) => x.id === id);
     if (!s) return;
 
     setActiveChatIdSync(s.id);
     setView("chat");
 
+    // If this thread came from DB list, it will have messages: [] until we fetch it.
+    if (!s.messages || s.messages.length === 0) {
+      const loaded = await loadThreadMessages(s.id);
+      if (loaded) {
+        const restoredSessionId = loaded.backendSessionId || s.backendSessionId || null;
+        setSessionId(restoredSessionId);
+        setUploaded(loaded.uploaded);
+        setCombinedTextLen(loaded.combinedTextLen);
+        setSelectedOutput(s.selectedOutput);
+        setSidebarActive(
+          s.selectedOutput === "flash_card"
+            ? "flash_cards"
+            : s.selectedOutput === "podcast"
+            ? "podcast"
+            : s.selectedOutput === "study_guide"
+            ? "study_guide"
+            : null
+        );
+        setMessages(loaded.messages);
+        setChatSessions((prev) =>
+          prev.map((cs) =>
+            cs.id === s.id
+              ? {
+                  ...cs,
+                  title: loaded.title,
+                  backendSessionId: loaded.backendSessionId,
+                  uploaded: loaded.uploaded,
+                  combinedTextLen: loaded.combinedTextLen,
+                  messages: loaded.messages,
+                  updatedAt: Date.now(),
+                }
+              : cs
+          )
+        );
+        return;
+      }
+    }
+
+    // fallback to local
     setUploaded(s.uploaded);
     setCombinedTextLen(s.combinedTextLen);
-    setSessionId(s.backendSessionId);
+    setSessionId(s.backendSessionId || null);
 
     setSelectedOutput(s.selectedOutput);
     setSidebarActive(
@@ -341,11 +504,49 @@ export default function DashboardPage() {
   };
 
   const canContinue = files.length > 0 && !uploading;
+  const composerPlaceholder = canChatInCurrentThread
+  ? "Ask for changes, add sections, shorten, format, etc..."
+  : "Pick Podcast / Study Guide / Narrative / Flash Card to start...";
+  const shouldShowOutputPicker = useMemo(() => {
+  if (view !== "chat") return false;
+  if (selectedOutput) return false;
+  if (!messages.length) return false;
+
+  const meaningful = messages.filter(
+    (m) =>
+      !m.loading &&
+      [m.title, m.meta, m.text]
+        .filter(Boolean)
+        .join("\n")
+        .trim().length > 0
+  );
+
+  const hasWelcome = meaningful.some(
+    (m) =>
+      m.role === "ai" &&
+      (((m.title || "").trim() === "Welcome") ||
+        /Pick an output above to generate first/i.test(m.text || ""))
+  );
+  if (!hasWelcome) return false;
+
+  const nonWelcomeMessages = meaningful.filter(
+    (m) =>
+      !(
+        m.role === "ai" &&
+        (((m.title || "").trim() === "Welcome") ||
+          /Pick an output above to generate first/i.test(m.text || ""))
+      )
+  );
+
+  return nonWelcomeMessages.length <= 1;
+}, [view, selectedOutput, messages]);
 
   // -----------------------------
   // Discord integration
   // -----------------------------
-  const BACKEND_BASE = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+  const BACKEND_BASE =
+    process.env.NEXT_PUBLIC_BACKEND_URL ||
+    (typeof window !== "undefined" ? `http://${window.location.hostname}:8000` : "http://localhost:8000");
   const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "";
 
   const getGreeting = () => {
@@ -396,18 +597,29 @@ export default function DashboardPage() {
       }
 
       const data = await res.json();
-      const profile: UserProfile | null = data?.user || data?.profile || null;
 
-      if (profile) setUserProfile(profile);
-      if (typeof data?.access_token === "string") setAccessToken(data.access_token);
+      // Backend may return either:
+      // 1) { user: {id, display_name, avatar_url}, access_token }
+      // 2) { id, display_name, avatar_url } (legacy)
+      const rawUser = data?.user || data?.profile || data;
 
-      // Persist if present
-      try {
-        if (profile) window.localStorage.setItem("pu_user_profile", JSON.stringify(profile));
-        if (typeof data?.access_token === "string") window.localStorage.setItem("pu_access_token", data.access_token);
-      } catch {
-        // ignore
-      }
+      const profile: UserProfile | null = rawUser
+        ? {
+            id: typeof rawUser.id === "string" ? rawUser.id : null,
+            name:
+              typeof rawUser.display_name === "string"
+                ? rawUser.display_name
+                : typeof rawUser.name === "string"
+                ? rawUser.name
+                : null,
+            avatar_url: typeof rawUser.avatar_url === "string" ? rawUser.avatar_url : null,
+            email: typeof rawUser.email === "string" ? rawUser.email : null,
+          }
+        : null;
+
+      if (profile && (profile.id || profile.email)) setUserProfile(profile);
+      if (typeof data?.access_token === "string" && data.access_token.trim()) setAccessToken(data.access_token);
+      // Leak-proof: do not persist auth/profile to localStorage
     } catch {
       if (!allowFail && !accessToken) {
         setUserProfile(null);
@@ -416,17 +628,17 @@ export default function DashboardPage() {
     }
   };
 
-  const claimAnonymousChatIfSupported = async (token: string) => {
-    if (!chatSessions.length) return;
+  const claimAnonymousChatIfSupported = async () => {
     try {
       await fetch(`${BACKEND_BASE}/api/chat/claim`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         credentials: "include",
-        body: JSON.stringify({ threads: chatSessions, active_id: activeChatIdRef.current }),
+        headers: {
+          ...authHeaders(),
+        },
       });
     } catch {
-      // ignore: endpoint may not exist yet
+      // ignore
     }
   };
 
@@ -479,16 +691,11 @@ export default function DashboardPage() {
       setUserProfile(mergedProfile);
       setAuthMenuOpen(false);
 
-      // Persist if present
-      try {
-        if (mergedProfile) window.localStorage.setItem("pu_user_profile", JSON.stringify(mergedProfile));
-        if (typeof data?.access_token === "string") window.localStorage.setItem("pu_access_token", data.access_token);
-      } catch {
-        // ignore
-      }
+      // Leak-proof: do not persist auth/profile to localStorage
 
       await refreshMe({ allowFail: true });
-      if (token) await claimAnonymousChatIfSupported(token);
+      await claimAnonymousChatIfSupported();
+      await loadThreadsFromBackend();
 
       // One-time greeting message
       // Only inject into an existing thread (avoid creating a junk "New chat" when user logs in before uploading).
@@ -574,14 +781,8 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    try {
-      const tok = localStorage.getItem("pu_access_token");
-      if (tok) setAccessToken(tok);
-
-      const p = localStorage.getItem("pu_user_profile");
-      if (p) setUserProfile(JSON.parse(p));
-    } catch {}
-
+    // Leak-proof: do not load tokens/profile from localStorage.
+    // Always ask backend (cookie-based session/refresh) for the current user.
     void refreshMe({ allowFail: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -624,32 +825,61 @@ export default function DashboardPage() {
     };
   }, [authMenuOpen]);
 
-  useEffect(() => {
-    if (!chatsHydrated) return;
-    try {
-      window.localStorage.setItem("pu_chat_sessions", JSON.stringify(chatSessions));
-      window.localStorage.setItem("pu_active_chat_id", activeChatIdRef.current || "");
-    } catch {
-      // ignore
-    }
-  }, [chatSessions, chatsHydrated]);
+  // Leak-proof: do not persist chat threads to localStorage
 
-  useEffect(() => {
+  const loadThreadsFromBackend = async () => {
     try {
-      const raw = window.localStorage.getItem("pu_chat_sessions");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) setChatSessions(parsed);
+      const res = await fetch(`${BACKEND_BASE}/api/chat/threads`, {
+        credentials: "include",
+        headers: {
+          ...authHeaders(),
+        },
+      });
+
+      if (!res.ok) {
+        setChatsHydrated(true);
+        return;
       }
 
-      const aid = window.localStorage.getItem("pu_active_chat_id") || "";
-      if (aid) setActiveChatIdSync(aid);
+      const data = await res.json();
+      const threads = Array.isArray(data?.threads) ? data.threads : [];
+
+      const mapped: ChatSession[] = threads.map((t: any) => {
+        const id = typeof t?.id === "string" ? t.id : crypto.randomUUID();
+        const title = typeof t?.title === "string" && t.title.trim() ? t.title.trim() : "Chat";
+        const updatedAt = t?.updated_at ? new Date(t.updated_at).getTime() : Date.now();
+
+        return {
+          id,
+          title,
+          updatedAt,
+          backendSessionId:
+            typeof t?.source_session_id === "string" && t.source_session_id.trim() ? t.source_session_id.trim() : null,
+          uploaded: Array.isArray(t?.source_files)
+            ? t.source_files.map((f: any) => ({
+                id: typeof f?.id === "string" ? f.id : crypto.randomUUID(),
+                name: typeof f?.name === "string" ? f.name : "unknown",
+                status: typeof f?.status === "string" ? f.status : "extracted",
+                textLen: typeof f?.textLen === "number" ? f.textLen : typeof f?.text_len === "number" ? f.text_len : 0,
+              }))
+            : [],
+          combinedTextLen: typeof t?.combined_text_len === "number" ? t.combined_text_len : 0,
+          selectedOutput: null,
+          messages: [],
+        };
+      });
+
+      setChatSessions(mapped);
+      setChatsHydrated(true);
     } catch {
-      // ignore
-    } finally {
-      // Critical: do not overwrite localStorage until we've attempted restore.
       setChatsHydrated(true);
     }
+  };
+
+  useEffect(() => {
+    // Leak-proof: do not hydrate chat sessions from localStorage.
+    // Chat history must come from the backend database.
+    void loadThreadsFromBackend();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -668,18 +898,14 @@ export default function DashboardPage() {
         // ignore
       }
 
-      try {
-        window.localStorage.removeItem("pu_access_token");
-        window.localStorage.removeItem("pu_user_profile");
-      } catch {
-        // ignore
-      }
+      // Leak-proof: no need to remove tokens/profile from localStorage
 
       setUserProfile(null);
       setAccessToken(null);
       setAuthMenuOpen(false);
       setAuthLoading(false);
       void refreshMe({ allowFail: true });
+      void loadThreadsFromBackend();
     }
   };
   const DISCORD_CONNECT_URL =
@@ -1299,6 +1525,21 @@ export default function DashboardPage() {
           messages: initialMessages,
           title: normalized[0]?.name ? normalized[0].name : "New chat",
         });
+        // Persist the initial thread + welcome messages so refresh doesn't wipe it.
+        // Adopt the backend thread id if the backend creates one.
+        const savedId = await persistThreadSnapshot({
+          forceThreadId: activeChatIdRef.current,
+          forceTitle: normalized[0]?.name ? normalized[0].name : "New chat",
+          forceMessages: initialMessages,
+        });
+        if (savedId && savedId !== activeChatIdRef.current) {
+          // Update active id and local sessions list to use the DB id
+          const oldId = activeChatIdRef.current;
+          setActiveChatIdSync(savedId);
+          setChatSessions((prev) =>
+            prev.map((cs) => (cs.id === oldId ? { ...cs, id: savedId } : cs))
+          );
+        }
         setSelectedOutput(null);
       } else {
         setMessages((prev) =>
@@ -1356,7 +1597,8 @@ export default function DashboardPage() {
   // -----------------------------
   const onSelectOutput = async (k: OutputType) => {
     if (generating) return;
-    if (!sessionId) {
+    const resolvedSessionId = effectiveSessionId;
+    if (!resolvedSessionId) {
       alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
       return;
     }
@@ -1391,7 +1633,7 @@ export default function DashboardPage() {
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
         body: JSON.stringify({
-          session_id: sessionId,
+          session_id: resolvedSessionId,
           output_type: k,
         }),
       });
@@ -1417,19 +1659,23 @@ export default function DashboardPage() {
           ? data.response
           : JSON.stringify(data);
 
-      setMessages((prev) => {
-        const next = prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
-        upsertActiveSession({ messages: next });
-        return next;
-      });
+      const nextMessages = messages
+        .concat([userMsg, aiLoading])
+        .map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+
+      setMessages(nextMessages);
+      upsertActiveSession({ messages: nextMessages });
+      void persistThreadSnapshot({ forceMessages: nextMessages });
     } catch (e: any) {
-      setMessages((prev) => {
-        const next = prev.map((m) =>
+      const nextMessages = messages
+        .concat([userMsg, aiLoading])
+        .map((m) =>
           m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
         );
-        upsertActiveSession({ messages: next });
-        return next;
-      });
+
+      setMessages(nextMessages);
+      upsertActiveSession({ messages: nextMessages });
+      void persistThreadSnapshot({ forceMessages: nextMessages });
     } finally {
       setGenerating(false);
     }
@@ -1441,7 +1687,8 @@ export default function DashboardPage() {
   const onSendChat = async () => {
     const text = chatInput.trim();
     if (!text || generating) return;
-    if (!sessionId) {
+    const resolvedSessionId = effectiveSessionId;
+    if (!resolvedSessionId) {
       alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
       return;
     }
@@ -1466,14 +1713,16 @@ export default function DashboardPage() {
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
         body: JSON.stringify({
-          session_id: sessionId,
+          session_id: resolvedSessionId,
+          thread_id: activeChatIdRef.current,
+          thread_title: uploaded?.[0]?.name ? uploaded[0].name : "Chat",
           message: text,
           history: messages
             .filter((m) => !m.loading)
             .filter((m) => m.role === "user" || m.role === "ai")
             .slice(-12)
             .map((m) => ({
-              role: m.role, // backend expects "user" | "ai"
+              role: m.role,
               content: [m.title, m.meta, m.text].filter(Boolean).join("\n"),
             })),
         }),
@@ -1485,6 +1734,12 @@ export default function DashboardPage() {
       }
 
       const data = await res.json();
+      const backendThreadId = typeof data?.thread_id === "string" ? data.thread_id : null;
+      if (backendThreadId && backendThreadId !== activeChatIdRef.current) {
+        const oldId = activeChatIdRef.current;
+        setActiveChatIdSync(backendThreadId);
+        setChatSessions((prev) => prev.map((cs) => (cs.id === oldId ? { ...cs, id: backendThreadId } : cs)));
+      }
       const answer =
         typeof data.answer === "string"
           ? data.answer
@@ -1494,19 +1749,26 @@ export default function DashboardPage() {
           ? data.response
           : JSON.stringify(data);
 
-      setMessages((prev) => {
-        const next = prev.map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
-        upsertActiveSession({ messages: next });
-        return next;
+      const nextMessages = messages
+        .concat([userMsg, aiLoading])
+        .map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+
+      setMessages(nextMessages);
+      upsertActiveSession({ messages: nextMessages });
+      void persistThreadSnapshot({
+        forceThreadId: backendThreadId || activeChatIdRef.current,
+        forceMessages: nextMessages,
       });
     } catch (e: any) {
-      setMessages((prev) => {
-        const next = prev.map((m) =>
+      const nextMessages = messages
+        .concat([userMsg, aiLoading])
+        .map((m) =>
           m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Something went wrong"}`, loading: false } : m
         );
-        upsertActiveSession({ messages: next });
-        return next;
-      });
+
+      setMessages(nextMessages);
+      upsertActiveSession({ messages: nextMessages });
+      void persistThreadSnapshot({ forceMessages: nextMessages });
     } finally {
       setGenerating(false);
     }
@@ -2771,34 +3033,28 @@ export default function DashboardPage() {
                     </div>
                   ))}
 
-                  {!selectedOutput ? (
-                    <div className="pu-msgRow right">
-                      <div className="pu-outputPickerInFeed">
-                        <div className="pu-pickerTitle">What should I make from your notes ??</div>
-                        <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
-                        <div className="pu-outputRow">
-                          {(
-                            [
-                              ["podcast", "Podcast"],
-                              ["study_guide", "Study Guide"],
-                              ["narrative", "Narrative"],
-                              ["flash_card", "Flash Card"],
-                            ] as Array<[OutputType, string]>
-                          ).map(([key, label]) => (
-                            <button
-                              key={key}
-                              type="button"
-                              className="pu-outputBtn"
-                              onClick={() => onSelectOutput(key)}
-                              disabled={generating || uploading}
-                            >
-                              {label}
-                            </button>
-                          ))}
-                        </div>
+                  {shouldShowOutputPicker && (
+                  <div className="pu-msgRow right">
+                    <div className="pu-outputPickerInFeed">
+                      <div className="pu-pickerTitle">What should I make from your notes ??</div>
+                      <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
+                      <div className="pu-outputRow">
+                        <button className="pu-outputBtn" onClick={() => void onSelectOutput("podcast")} disabled={generating}>
+                          Podcast
+                        </button>
+                        <button className="pu-outputBtn" onClick={() => void onSelectOutput("study_guide")} disabled={generating}>
+                          Study Guide
+                        </button>
+                        <button className="pu-outputBtn" onClick={() => void onSelectOutput("narrative")} disabled={generating}>
+                          Narrative
+                        </button>
+                        <button className="pu-outputBtn" onClick={() => void onSelectOutput("flash_card")} disabled={generating}>
+                          Flash Card
+                        </button>
                       </div>
                     </div>
-                  ) : null}
+                  </div>
+                )}
                 </div>
 
                 {/* Bottom bar */}
@@ -2815,11 +3071,7 @@ export default function DashboardPage() {
 
                     <input
                       className="pu-chatInput"
-                      placeholder={
-                        selectedOutput
-                          ? "Ask for changes, add sections, shorten, format, etc…"
-                          : "Pick Podcast / Study Guide / Narrative / Flash Card to start…"
-                      }
+                      placeholder={composerPlaceholder}
                       value={chatInput}
                       onChange={(e) => setChatInput(e.target.value)}
                       onKeyDown={(e) => {
@@ -2828,7 +3080,7 @@ export default function DashboardPage() {
                           onSendChat();
                         }
                       }}
-                      disabled={!selectedOutput}
+                      disabled={generating || (!canChatInCurrentThread && !files.length && !uploaded.length)}
                       suppressHydrationWarning
                       autoComplete="off"
                       autoCorrect="off"
@@ -2841,7 +3093,7 @@ export default function DashboardPage() {
                     <button
                       className="pu-send"
                       onClick={onSendChat}
-                      disabled={generating || !chatInput.trim() || !selectedOutput}
+                      disabled={generating || !chatInput.trim() || !canChatInCurrentThread}
                       aria-label="Send"
                       suppressHydrationWarning
                     >
