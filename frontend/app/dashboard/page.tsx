@@ -13,9 +13,16 @@ type DiscordGuild = {
   owner?: boolean;
   permissions?: string | number;
   can_manage?: boolean;
+  installed?: boolean;
 };
 
 type DiscordInstallPayload = { invite_url: string; message: string };
+type DiscordChannel = {
+  id: string;
+  name: string;
+  type?: number;
+  parent_id?: string | null;
+};
 
 type LocalFile = { id: string; file: File };
 
@@ -350,8 +357,6 @@ export default function DashboardPage() {
       );
     });
   };
-
-  const canContinue = files.length > 0 && !uploading;
 
   // -----------------------------
   // Discord integration
@@ -714,6 +719,10 @@ export default function DashboardPage() {
   const [discordInstallError, setDiscordInstallError] = useState<string>("");
   const [discordRequestMessage, setDiscordRequestMessage] = useState<string>("");
   const [discordRequestInvite, setDiscordRequestInvite] = useState<string>("");
+  const [discordChannels, setDiscordChannels] = useState<DiscordChannel[]>([]);
+  const [discordChannelsLoading, setDiscordChannelsLoading] = useState(false);
+  const [selectedDiscordGuildId, setSelectedDiscordGuildId] = useState<string>("");
+  const [selectedDiscordChannelId, setSelectedDiscordChannelId] = useState<string>("");
 
   const fetchDiscordGuilds = async () => {
     setDiscordGuildsLoading(true);
@@ -738,11 +747,66 @@ export default function DashboardPage() {
     }
   };
 
+const fetchDiscordChannels = async (guildId: string) => {
+  setDiscordChannelsLoading(true);
+  try {
+    const res = await fetch(`${BACKEND_BASE}/api/discord/bot/guilds/${guildId}/channels`, {
+      credentials: "include",
+      headers: { ...authHeaders() },
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(msg || "Failed to load Discord channels");
+    }
+    const data = await res.json();
+    const chans: DiscordChannel[] = Array.isArray(data?.channels) ? data.channels : [];
+    setDiscordChannels(chans);
+    setSelectedDiscordGuildId(guildId);
+    setSelectedDiscordChannelId((prev) => (prev && chans.some((c) => c.id === prev) ? prev : chans[0]?.id || ""));
+  } catch {
+    setDiscordChannels([]);
+    setSelectedDiscordGuildId(guildId);
+    setSelectedDiscordChannelId("");
+  } finally {
+    setDiscordChannelsLoading(false);
+  }
+};
+
   const openDiscordInstall = async () => {
     setDiscordInstallOpen(true);
     setDiscordRequestMessage("");
     setDiscordRequestInvite("");
     await fetchDiscordGuilds();
+  };
+
+  const prepareDiscordSourceInBackground = async () => {
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/discord/guilds`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) return;
+
+      const data = await res.json();
+      const guilds: DiscordGuild[] = Array.isArray(data?.guilds) ? data.guilds : [];
+      setDiscordGuilds(guilds);
+
+      const installedGuilds = guilds.filter((g) => g.installed);
+      if (installedGuilds.length > 0) {
+        await fetchDiscordChannels(installedGuilds[0].id);
+      } else {
+        setDiscordChannels([]);
+        setSelectedDiscordGuildId("");
+        setSelectedDiscordChannelId("");
+      }
+    } catch {
+      // ignore background discovery failures on upload screen
+    }
+  };
+
+  const refreshDiscordInstallState = async () => {
+  await fetchDiscordGuilds();
+  await prepareDiscordSourceInBackground();
   };
 
   const installBot = async () => {
@@ -755,10 +819,28 @@ export default function DashboardPage() {
         const msg = await res.text();
         throw new Error(msg || "Failed to generate bot install URL");
       }
+
       const data = await res.json();
       const url = typeof data?.url === "string" ? data.url : "";
       if (!url) throw new Error("Missing bot install URL");
-      window.open(url, "_blank", "noopener,noreferrer");
+
+      const popup = window.open(url, "_blank", "noopener,noreferrer");
+
+      // Refresh once right away
+      void refreshDiscordInstallState();
+
+      // Then poll for a short time while Discord install is happening
+      let ticks = 0;
+      const timer = window.setInterval(() => {
+        ticks += 1;
+        void refreshDiscordInstallState();
+
+        const popupClosed = !popup || popup.closed;
+        if (popupClosed || ticks >= 30) {
+          window.clearInterval(timer);
+          void refreshDiscordInstallState();
+        }
+      }, 2000);
     } catch (e: any) {
       setDiscordInstallError(e?.message || "Failed to generate bot install URL");
     }
@@ -801,6 +883,21 @@ export default function DashboardPage() {
       // ignore
     }
   };
+
+  const sortedDiscordGuilds = useMemo(() => {
+  return [...discordGuilds].sort((a, b) => {
+    const rank = (g: DiscordGuild) => (g.installed ? 0 : g.can_manage ? 1 : 2);
+    const diff = rank(a) - rank(b);
+    if (diff !== 0) return diff;
+    return a.name.localeCompare(b.name);
+  });
+  }, [discordGuilds]);
+
+  useEffect(() => {
+  if (discordState !== "connected") return;
+  void prepareDiscordSourceInBackground();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [discordState]);
 
   // Read the redirect result from the URL once (prevents repeated token exchange loops)
   useEffect(() => {
@@ -876,7 +973,11 @@ export default function DashboardPage() {
   };
 
   // Auto-upload-more behavior (no sync button)
+  const selectedDiscordGuild = discordGuilds.find((g) => g.id === selectedDiscordGuildId) || null;
+  const selectedDiscordChannel = discordChannels.find((c) => c.id === selectedDiscordChannelId) || null;
+  const hasDiscordSource = discordState === "connected" && !!selectedDiscordGuild && !!selectedDiscordChannel;
   const pendingUploadCount = Math.max(0, files.length - uploaded.length);
+  const canContinue = (files.length > 0 || hasDiscordSource) && !uploading;
   const autoSyncLockRef = useRef(false);
   const lastAutoUploadKeyRef = useRef<string>("");
 
@@ -1312,113 +1413,167 @@ export default function DashboardPage() {
   // -----------------------------
   // Upload to backend
   // -----------------------------
-  const uploadToBackend = async () => {
-    if (!files.length || uploading) return;
+const uploadToBackend = async () => {
+  if ((!files.length && !hasDiscordSource) || uploading) return;
 
-    setUploading(true);
-    try {
-      const form = new FormData();
-      for (const f of files) form.append("files", f.file);
+  setUploading(true);
+  try {
+    const form = new FormData();
 
-      const res = await fetch(`${BACKEND_BASE}/api/upload`, {
-        method: "POST",
-        body: form,
-        credentials: "include",
-        headers: {
-          ...authHeaders(),
-        },
-      });
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg || "Upload failed");
+    for (const f of files) {
+      form.append("files", f.file);
+    }
+
+    if (hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel) {
+      const importRes = await fetch(
+        `${BACKEND_BASE}/api/discord/bot/channels/${selectedDiscordChannel.id}/import?max_messages=300`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            ...authHeaders(),
+          },
+        }
+      );
+
+      if (!importRes.ok) {
+        const msg = await importRes.text();
+        throw new Error(msg || "Discord import failed");
       }
 
-      const data = await res.json();
+      const importData = await importRes.json();
+      const discordText = typeof importData?.text === "string" ? importData.text : "";
 
-      // Support both backend response shapes:
-      // Old: { files, combined_text, combined_len }
-      // New: { session_id, files, preview, preview_len, ttl_seconds }
-      const sid = typeof data.session_id === "string" ? data.session_id : null;
-      if (sid) setSessionId(sid);
+      if (discordText.trim()) {
+        const safeGuild =
+          selectedDiscordGuild.name.replace(/[^a-zA-Z0-9-_ ]/g, "").trim() || "discord-server";
+        const safeChannel =
+          selectedDiscordChannel.name.replace(/[^a-zA-Z0-9-_ ]/g, "").trim() || "channel";
 
-      const normalized: UploadedFile[] = (data.files || []).map((f: any) => {
-        const name = f.name || f.filename || "unknown";
-        const status = f.status || "extracted";
+        const discordFile = new File(
+          [discordText],
+          `${safeGuild} - ${safeChannel}.txt`,
+          { type: "text/plain" }
+        );
 
-        // Prefer server-provided lengths if present
-        const textLen =
-          typeof f.text_len === "number"
-            ? f.text_len
-            : typeof f.textLen === "number"
-            ? f.textLen
-            : typeof f.text === "string"
-            ? f.text.length
-            : 0;
+        form.append("files", discordFile);
+      }
+    }
 
-        return { id: crypto.randomUUID(), name, status, textLen };
-      });
+    const res = await fetch(`${BACKEND_BASE}/api/upload`, {
+      method: "POST",
+      body: form,
+      credentials: "include",
+      headers: {
+        ...authHeaders(),
+      },
+    });
 
-      // Prefer server-provided combined length; fallback to combined_text length; fallback to preview length
-      const combinedLen =
-        typeof data.combined_len === "number"
-          ? data.combined_len
-          : typeof data.combinedLen === "number"
-          ? data.combinedLen
-          : typeof data.combined_text === "string"
-          ? data.combined_text.length
-          : typeof data.preview_len === "number"
-          ? data.preview_len
-          : typeof data.preview === "string"
-          ? data.preview.length
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(msg || "Upload failed");
+    }
+
+    const data = await res.json();
+
+    const sid = typeof data.session_id === "string" ? data.session_id : null;
+    if (sid) setSessionId(sid);
+
+    const normalized: UploadedFile[] = (data.files || []).map((f: any) => {
+      const name = f.name || f.filename || "unknown";
+      const status = f.status || "extracted";
+
+      const textLen =
+        typeof f.text_len === "number"
+          ? f.text_len
+          : typeof f.textLen === "number"
+          ? f.textLen
+          : typeof f.text === "string"
+          ? f.text.length
           : 0;
 
-      setUploaded(normalized);
-      setCombinedTextLen(combinedLen);
-      // Only upsert here when we are already in chat (adding more files).
-      // For the first upload, we upsert once with both sources + initial messages below.
-      if (view !== "upload") {
-        upsertActiveSession({ backendSessionId: sid || sessionId, uploaded: normalized, combinedTextLen: combinedLen });
-      }
+      return { id: crypto.randomUUID(), name, status, textLen };
+    });
 
-      if (view === "upload") {
-        setView("chat");
-        const initialMessages: ChatMessage[] = [
-          {
-            id: crypto.randomUUID(),
-            role: "user",
-            title: "Hello",
-            text: `I uploaded ${normalized.length || 0} file(s). Can you help me?`,
-          },
-          {
-            id: crypto.randomUUID(),
-            role: "ai",
-            title: "Welcome",
-            meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
-            text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
-          },
-        ];
-        setMessages(initialMessages);
-        upsertActiveSession({
-          backendSessionId: sid || sessionId,
-          uploaded: normalized,
-          combinedTextLen: combinedLen,
-          messages: initialMessages,
-          title: normalized[0]?.name ? normalized[0].name : "New chat",
-        });
-        setSelectedOutput(null);
-      } else {
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.role === "ai" && m.title === "Welcome"
-              ? { ...m, meta: `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel` }
-              : m
-          )
-        );
-      }
-    } finally {
-      setUploading(false);
+    const combinedLen =
+      typeof data.combined_len === "number"
+        ? data.combined_len
+        : typeof data.combinedLen === "number"
+        ? data.combinedLen
+        : typeof data.combined_text === "string"
+        ? data.combined_text.length
+        : typeof data.preview_len === "number"
+        ? data.preview_len
+        : typeof data.preview === "string"
+        ? data.preview.length
+        : 0;
+
+    setUploaded(normalized);
+    setCombinedTextLen(combinedLen);
+
+    if (view !== "upload") {
+      upsertActiveSession({
+        backendSessionId: sid || sessionId,
+        uploaded: normalized,
+        combinedTextLen: combinedLen,
+      });
     }
-  };
+
+    if (view === "upload") {
+      setView("chat");
+
+      const sourceMeta =
+        hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel
+          ? `Sources: ${normalized.length || 0} file(s) • Discord ${selectedDiscordGuild.name} • #${selectedDiscordChannel.name}`
+          : `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`;
+
+      const initialMessages: ChatMessage[] = [
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          title: "Hello",
+          text:
+            hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel
+              ? `I connected Discord and want to use #${selectedDiscordChannel.name} from ${selectedDiscordGuild.name}. Can you help me?`
+              : `I uploaded ${normalized.length || 0} file(s). Can you help me?`,
+        },
+        {
+          id: crypto.randomUUID(),
+          role: "ai",
+          title: "Welcome",
+          meta: sourceMeta,
+          text: "Pick an output above to generate first. After that, use the chat bar to refine it.",
+        },
+      ];
+
+      setMessages(initialMessages);
+      upsertActiveSession({
+        backendSessionId: sid || sessionId,
+        uploaded: normalized,
+        combinedTextLen: combinedLen,
+        messages: initialMessages,
+        title: normalized[0]?.name ? normalized[0].name : "New chat",
+      });
+      setSelectedOutput(null);
+    } else {
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.role === "ai" && m.title === "Welcome"
+            ? {
+                ...m,
+                meta:
+                  hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel
+                    ? `Sources: ${normalized.length || 0} file(s) • Discord ${selectedDiscordGuild.name} • #${selectedDiscordChannel.name}`
+                    : `Sources: ${normalized.length || 0} file(s) • ${channelsCount} channel`,
+              }
+            : m
+        )
+      );
+    }
+  } finally {
+    setUploading(false);
+  }
+};
 
   const onContinue = async () => {
     try {
@@ -2646,7 +2801,7 @@ export default function DashboardPage() {
                 </div>
 
                 <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-                  {(discordGuilds || []).map((g) => (
+                  {sortedDiscordGuilds.map((g) => (
                     <div
                       key={g.id}
                       style={{
@@ -2663,11 +2818,19 @@ export default function DashboardPage() {
                       <div style={{ minWidth: 0 }}>
                         <div style={{ fontWeight: 950, fontSize: 12, color: "rgba(255,255,255,0.92)" }}>{g.name}</div>
                         <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.62)" }}>
-                          {g.can_manage ? "You can install apps here" : "Admin permission required"}
+                          {g.installed
+                            ? "Bot already installed"
+                            : g.can_manage
+                              ? "You can install apps here"
+                              : "Admin permission required"}
                         </div>
                       </div>
 
-                      {g.can_manage ? (
+                      {g.installed ? (
+                        <button className="pu-btn pu-btnDisabled" type="button" disabled title="Bot is already installed">
+                          Installed
+                        </button>
+                      ) : g.can_manage ? (
                         <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
                           Add bot
                         </button>
@@ -2679,7 +2842,7 @@ export default function DashboardPage() {
                     </div>
                   ))}
 
-                  {!discordGuildsLoading && (!discordGuilds || discordGuilds.length === 0) ? (
+                  {!discordGuildsLoading && sortedDiscordGuilds.length === 0 ? (
                     <div style={{ fontSize: 12, color: "rgba(255,255,255,0.62)", padding: 10 }}>
                       No servers found. Make sure you authorized the correct Discord account.
                     </div>
@@ -2902,10 +3065,12 @@ export default function DashboardPage() {
 
                         <div className="pu-dropSub">
                           {discordState === "connected"
-                            ? "Discord connected. Next: add the bot to a server (if you haven’t yet)."
-                            : discordState === "connecting"
-                            ? "Opening Discord authorization…"
-                            : "Link your Discord account so we can import your server/channel content."}
+                            ? discordChannelsLoading
+                              ? "Discord connected. Scanning installed servers and channels in the background…"
+                              : selectedDiscordGuild && selectedDiscordChannel
+                                ? `Discord connected. Ready from ${selectedDiscordGuild.name} • #${selectedDiscordChannel.name}.`
+                                : "Discord connected. Next: add the bot to a server (if you haven't yet)."
+                            : "Connect Discord to pull your server data in the background."}
                         </div>
 
                         {discordState === "error" && discordError ? (

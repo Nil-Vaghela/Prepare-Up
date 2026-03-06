@@ -77,6 +77,27 @@ async def _bot_is_in_guild(guild_id: str) -> bool:
     raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
 
+async def _guild_with_bot_status(g: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one simplified guild payload including whether the bot is already installed."""
+    perms = g.get("permissions")
+    guild_id = g.get("id")
+    installed = False
+    if guild_id:
+        try:
+            installed = await _bot_is_in_guild(guild_id)
+        except HTTPException:
+            installed = False
+
+    return {
+        "id": guild_id,
+        "name": g.get("name"),
+        "owner": g.get("owner"),
+        "permissions": perms,
+        "can_manage": _can_manage_guild(perms) or bool(g.get("owner")),
+        "installed": installed,
+    }
+
+
 async def _post_form_with_retries(url: str, data: Dict[str, Any], headers: Dict[str, str], *, max_retries: int = 5):
     """POST x-www-form-urlencoded with basic retry/backoff for Discord rate limits."""
     backoff = 1.0
@@ -226,18 +247,7 @@ async def discord_guilds(request: Request):
 
     guilds = await _discord_api_get(access, "/users/@me/guilds")
 
-    simplified = []
-    for g in (guilds or []):
-        perms = g.get("permissions")
-        simplified.append(
-            {
-                "id": g.get("id"),
-                "name": g.get("name"),
-                "owner": g.get("owner"),
-                "permissions": perms,
-                "can_manage": _can_manage_guild(perms) or bool(g.get("owner")),
-            }
-        )
+    simplified = [await _guild_with_bot_status(g) for g in (guilds or [])]
     return JSONResponse({"guilds": simplified})
 
 
