@@ -4,7 +4,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import * as THREE from "three";
 
+
 type DiscordConnectState = "idle" | "connecting" | "connected" | "error";
+
+type DiscordGuild = {
+  id: string;
+  name: string;
+  owner?: boolean;
+  permissions?: string | number;
+  can_manage?: boolean;
+};
+
+type DiscordInstallPayload = { invite_url: string; message: string };
 
 type LocalFile = { id: string; file: File };
 
@@ -923,6 +934,99 @@ export default function DashboardPage() {
 
   const [discordState, setDiscordState] = useState<DiscordConnectState>("idle");
   const [discordError, setDiscordError] = useState<string>("");
+  const [discordGuilds, setDiscordGuilds] = useState<DiscordGuild[]>([]);
+  const [discordGuildsLoading, setDiscordGuildsLoading] = useState(false);
+  const [discordInstallOpen, setDiscordInstallOpen] = useState(false);
+  const [discordInstallError, setDiscordInstallError] = useState<string>("");
+  const [discordRequestMessage, setDiscordRequestMessage] = useState<string>("");
+  const [discordRequestInvite, setDiscordRequestInvite] = useState<string>("");
+
+  const fetchDiscordGuilds = async () => {
+    setDiscordGuildsLoading(true);
+    setDiscordInstallError("");
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/discord/guilds`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Failed to load Discord servers");
+      }
+      const data = await res.json();
+      const guilds: DiscordGuild[] = Array.isArray(data?.guilds) ? data.guilds : [];
+      setDiscordGuilds(guilds);
+    } catch (e: any) {
+      setDiscordInstallError(e?.message || "Failed to load Discord servers");
+      setDiscordGuilds([]);
+    } finally {
+      setDiscordGuildsLoading(false);
+    }
+  };
+
+  const openDiscordInstall = async () => {
+    setDiscordInstallOpen(true);
+    setDiscordRequestMessage("");
+    setDiscordRequestInvite("");
+    await fetchDiscordGuilds();
+  };
+
+  const installBot = async () => {
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/discord/bot/install-url`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Failed to generate bot install URL");
+      }
+      const data = await res.json();
+      const url = typeof data?.url === "string" ? data.url : "";
+      if (!url) throw new Error("Missing bot install URL");
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (e: any) {
+      setDiscordInstallError(e?.message || "Failed to generate bot install URL");
+    }
+  };
+
+  const requestAdminInstall = async (g: DiscordGuild) => {
+    setDiscordRequestMessage("");
+    setDiscordRequestInvite("");
+    setDiscordInstallError("");
+    try {
+      const qs = new URLSearchParams({ guild_id: g.id, guild_name: g.name });
+      const res = await fetch(`${BACKEND_BASE}/api/discord/bot/request-install?${qs.toString()}`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Failed to generate admin request message");
+      }
+      const data: DiscordInstallPayload = await res.json();
+      setDiscordRequestMessage(data?.message || "");
+      setDiscordRequestInvite(data?.invite_url || "");
+
+      // Auto-copy for convenience
+      try {
+        if (data?.message) await navigator.clipboard.writeText(data.message);
+      } catch {
+        // ignore
+      }
+    } catch (e: any) {
+      setDiscordInstallError(e?.message || "Failed to generate admin request message");
+    }
+  };
+
+  const copyRequestMessage = async () => {
+    try {
+      if (!discordRequestMessage) return;
+      await navigator.clipboard.writeText(discordRequestMessage);
+    } catch {
+      // ignore
+    }
+  };
 
   // Read the redirect result from the URL once (prevents repeated token exchange loops)
   useEffect(() => {
@@ -985,14 +1089,16 @@ export default function DashboardPage() {
   };
 
   const onInviteBot = () => {
-    if (!DISCORD_BOT_INVITE_URL) {
+    if (typeof window === "undefined") return;
+
+    // Must connect Discord first so we can list servers + permissions.
+    if (discordState !== "connected") {
       setDiscordState("error");
-      setDiscordError(
-        "Missing Discord Client ID. Set NEXT_PUBLIC_DISCORD_CLIENT_ID (or NEXT_PUBLIC_DISCORD_BOT_INVITE_URL) in the frontend env."
-      );
+      setDiscordError("Connect Discord first, then choose a server to install the bot.");
       return;
     }
-    window.open(DISCORD_BOT_INVITE_URL, "_blank", "noopener,noreferrer");
+
+    void openDiscordInstall();
   };
 
   // Auto-upload-more behavior (no sync button)
@@ -2744,6 +2850,144 @@ export default function DashboardPage() {
 
         {/* Main */}
         <main className="pu-glass pu-main">
+          {discordInstallOpen ? (
+            <div
+              role="dialog"
+              aria-modal="true"
+              style={{
+                position: "fixed",
+                inset: 0,
+                zIndex: 50,
+                background: "rgba(0,0,0,0.55)",
+                display: "grid",
+                placeItems: "center",
+                padding: 16,
+              }}
+              onMouseDown={(e) => {
+                if (e.target === e.currentTarget) setDiscordInstallOpen(false);
+              }}
+            >
+              <div
+                className="pu-glass"
+                style={{
+                  width: "min(820px, 100%)",
+                  maxHeight: "min(80vh, 720px)",
+                  overflow: "auto",
+                  padding: 16,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                  <div style={{ fontWeight: 950, fontSize: 14 }}>Add PrepareUp Bot</div>
+                  <button className="pu-btn" type="button" onClick={() => setDiscordInstallOpen(false)}>
+                    Close
+                  </button>
+                </div>
+
+                <div style={{ marginTop: 8, fontSize: 12, color: "rgba(255,255,255,0.70)", lineHeight: 1.5 }}>
+                  Select a server. If you don’t have permission to install apps, we’ll generate a message you can send to an
+                  admin (auto-copied).
+                </div>
+
+                {discordInstallError ? (
+                  <div style={{ marginTop: 10, fontSize: 12, color: "rgba(255,120,120,0.95)" }}>{discordInstallError}</div>
+                ) : null}
+
+                <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <button
+                    className={`pu-btn ${discordGuildsLoading ? "pu-btnDisabled" : ""}`}
+                    type="button"
+                    onClick={() => void fetchDiscordGuilds()}
+                    disabled={discordGuildsLoading}
+                  >
+                    {discordGuildsLoading ? "Loading…" : "Refresh servers"}
+                  </button>
+
+                  <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
+                    Open install link
+                  </button>
+                </div>
+
+                <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+                  {(discordGuilds || []).map((g) => (
+                    <div
+                      key={g.id}
+                      style={{
+                        border: "1px solid rgba(255,255,255,0.10)",
+                        borderRadius: 16,
+                        padding: 12,
+                        background: "rgba(255,255,255,0.03)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 12,
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 950, fontSize: 12, color: "rgba(255,255,255,0.92)" }}>{g.name}</div>
+                        <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.62)" }}>
+                          {g.can_manage ? "You can install apps here" : "Admin permission required"}
+                        </div>
+                      </div>
+
+                      {g.can_manage ? (
+                        <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
+                          Add bot
+                        </button>
+                      ) : (
+                        <button className="pu-btn" type="button" onClick={() => void requestAdminInstall(g)}>
+                          Request admin
+                        </button>
+                      )}
+                    </div>
+                  ))}
+
+                  {!discordGuildsLoading && (!discordGuilds || discordGuilds.length === 0) ? (
+                    <div style={{ fontSize: 12, color: "rgba(255,255,255,0.62)", padding: 10 }}>
+                      No servers found. Make sure you authorized the correct Discord account.
+                    </div>
+                  ) : null}
+                </div>
+
+                {discordRequestMessage ? (
+                  <div style={{ marginTop: 16 }}>
+                    <div style={{ fontWeight: 950, fontSize: 12 }}>Message to send to an admin</div>
+                    <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                      <button className="pu-btn" type="button" onClick={() => void copyRequestMessage()}>
+                        Copy message
+                      </button>
+                      {discordRequestInvite ? (
+                        <button
+                          className="pu-btn"
+                          type="button"
+                          onClick={() => window.open(discordRequestInvite, "_blank", "noopener,noreferrer")}
+                        >
+                          Open invite link
+                        </button>
+                      ) : null}
+                    </div>
+                    <textarea
+                      value={discordRequestMessage}
+                      readOnly
+                      style={{
+                        marginTop: 10,
+                        width: "100%",
+                        minHeight: 140,
+                        borderRadius: 14,
+                        border: "1px solid rgba(255,255,255,0.12)",
+                        background: "rgba(10,12,18,0.35)",
+                        color: "rgba(255,255,255,0.90)",
+                        padding: 12,
+                        outline: "none",
+                        resize: "vertical",
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                      }}
+                    />
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
           <div className="pu-topbar">
           <div />
 
@@ -2946,12 +3190,11 @@ export default function DashboardPage() {
                         </button>
 
                         <button
-                          className={`pu-btn ${!DISCORD_BOT_INVITE_URL ? "pu-btnDisabled" : ""}`}
-                          onClick={onInviteBot}
+                          className={`pu-btn ${discordState === "connected" ? "" : "pu-btnDisabled"}`}
                           type="button"
-                          disabled={!DISCORD_BOT_INVITE_URL}
-                          suppressHydrationWarning
-                          title={!DISCORD_BOT_INVITE_URL ? "Set NEXT_PUBLIC_DISCORD_CLIENT_ID or NEXT_PUBLIC_DISCORD_BOT_INVITE_URL" : ""}
+                          onClick={onInviteBot}
+                          disabled={discordState !== "connected"}
+                          title={discordState === "connected" ? "" : "Connect Discord first"}
                         >
                           <DownloadIcon />
                           Add Bot

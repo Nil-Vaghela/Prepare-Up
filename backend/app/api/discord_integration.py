@@ -10,10 +10,23 @@ from fastapi.responses import RedirectResponse, JSONResponse
 
 router = APIRouter()
 
-DISCORD_AUTH_BASE = "https://discord.com/api/oauth2/authorize"
+DISCORD_AUTH_BASE = "https://discord.com/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api"
 DISCORD_API_V10 = "https://discord.com/api/v10"
+
+
+# Discord permission bit(s)
+MANAGE_GUILD = 0x20  # "Manage Server"
+
+
+def _can_manage_guild(permissions: Any) -> bool:
+    """Return True if the user's guild permissions include Manage Server."""
+    try:
+        p = int(permissions)
+    except (TypeError, ValueError):
+        return False
+    return (p & MANAGE_GUILD) == MANAGE_GUILD
 
 
 def _env(name: str, default: Optional[str] = None) -> str:
@@ -46,6 +59,22 @@ def _bot_token() -> str:
 
 def _bot_headers() -> Dict[str, str]:
     return {"Authorization": f"Bot {_bot_token()}"}
+
+
+async def _bot_is_in_guild(guild_id: str) -> bool:
+    """Return True if the bot token can access the guild (meaning the bot is installed)."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(f"{DISCORD_API_V10}/guilds/{guild_id}", headers=_bot_headers())
+    if resp.status_code == 200:
+        return True
+    # If the bot isn't in the server, Discord typically returns 404 (Unknown Guild) or 403.
+    if resp.status_code in (403, 404):
+        return False
+    if resp.status_code == 429:
+        # Don't fail hard on rate-limit; treat as unknown/not installed for now.
+        return False
+    # Other errors should surface for debugging.
+    raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
 
 async def _post_form_with_retries(url: str, data: Dict[str, Any], headers: Dict[str, str], *, max_retries: int = 5):
@@ -197,10 +226,18 @@ async def discord_guilds(request: Request):
 
     guilds = await _discord_api_get(access, "/users/@me/guilds")
 
-    simplified = [
-        {"id": g.get("id"), "name": g.get("name"), "owner": g.get("owner"), "permissions": g.get("permissions")}
-        for g in (guilds or [])
-    ]
+    simplified = []
+    for g in (guilds or []):
+        perms = g.get("permissions")
+        simplified.append(
+            {
+                "id": g.get("id"),
+                "name": g.get("name"),
+                "owner": g.get("owner"),
+                "permissions": perms,
+                "can_manage": _can_manage_guild(perms) or bool(g.get("owner")),
+            }
+        )
     return JSONResponse({"guilds": simplified})
 
 
@@ -216,8 +253,48 @@ async def discord_bot_install_url():
         "client_id": client_id,
         "permissions": str(permissions),
         "scope": scopes,
+        "disable_guild_select": "false",
     }
     return JSONResponse({"url": f"{DISCORD_AUTH_BASE}?{urlencode(params)}"})
+
+
+@router.get("/discord/bot/guilds/{guild_id}/installed")
+async def discord_bot_installed(guild_id: str):
+    """Returns whether the bot is currently installed in the given guild."""
+    installed = await _bot_is_in_guild(guild_id)
+    return JSONResponse({"guild_id": guild_id, "installed": installed})
+
+
+@router.get("/discord/bot/request-install")
+async def discord_bot_request_install(
+    request: Request,
+    guild_id: str = Query(..., description="Guild/server ID"),
+    guild_name: str = Query(..., description="Guild/server name"),
+):
+    """If the user can't install the bot, return a message they can send to a server admin."""
+    sess = _get_session(request)
+    access = (sess.get("discord") or {}).get("access_token")
+    if not access:
+        raise HTTPException(status_code=401, detail="Discord not connected")
+
+    me = await _discord_api_get(access, "/users/@me")
+    username = me.get("username") or "a user"
+
+    # Reuse the same invite URL your UI uses for install
+    client_id = _client_id()
+    permissions = int(os.getenv("DISCORD_BOT_PERMISSIONS", "66560"))
+    scopes = "bot applications.commands"
+    invite_url = f"{DISCORD_AUTH_BASE}?{urlencode({'client_id': client_id, 'permissions': str(permissions), 'scope': scopes, 'disable_guild_select': 'false'})}"
+
+    message = (
+        f"Hi! {username} is trying to connect the Discord server '{guild_name}' (ID: {guild_id}) to PrepareUp, "
+        "but they don't have permission to install apps/bots.\n\n"
+        "Could you please install the PrepareUp bot using this link:\n"
+        f"{invite_url}\n\n"
+        "After installing, return to PrepareUp to finish setup."
+    )
+
+    return JSONResponse({"invite_url": invite_url, "message": message})
 
 
 @router.get("/discord/bot/guilds/{guild_id}/channels")
