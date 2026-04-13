@@ -6,7 +6,6 @@ import os
 import uuid
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
 from app.core.config import settings
@@ -17,7 +16,7 @@ from app.api.upload import router as upload_router
 from app.api.generate import router as generate_router
 from app.api.chat import router as chat_router
 from app.api.discord_integration import router as discord_router
-from app.api.auth import router as auth_router  # ✅ NEW
+from app.api.auth import router as auth_router
 
 app = FastAPI(title=settings.APP_NAME)
 
@@ -56,9 +55,10 @@ async def ensure_anon_session(request: Request, call_next):
             value=new_sid,
             httponly=True,
             samesite="lax",
-            secure=False,  # set True when you are on HTTPS
+            secure=False,
             path="/",
-            max_age=60 * 60 * 24 * 30,  # 30 days
+            domain="localhost",
+            max_age=60 * 60 * 24 * 30,
         )
 
     return response
