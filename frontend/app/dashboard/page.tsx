@@ -121,12 +121,11 @@ export default function DashboardPage() {
 
   const onSidebarSelect = (key: "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
     setSidebarActive(key);
-    if (!effectiveSessionId && uploaded.length === 0) return; // need content first
-    if (view !== "chat") setView("chat");
-    if (key === "flash_cards") { void onSelectOutput("flash_card"); return; }
-    if (key === "podcast")     { void onSelectOutput("podcast");    return; }
-    if (key === "mock_test")   { void onSelectOutput("flash_card"); return; } // uses quiz via chat
-    if (key === "study_guide") { void onSelectOutput("study_guide"); return; }
+    // Navigate to dedicated feature pages — they have their own chat-selection flow
+    if (key === "flash_cards") { router.push("/flashcard");  return; }
+    if (key === "podcast")     { router.push("/podcast");    return; }
+    if (key === "mock_test")   { router.push("/mockquiz");   return; }
+    if (key === "study_guide") { router.push("/studyguide"); return; }
   };
 
   // Background mount

@@ -2,26 +2,37 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import Sidebar from "../../components/Sidebar";
+import AnimatedBackground from "../../components/AnimatedBackground";
 import { useAuth } from "../../lib/auth-context";
-import { generatePodcast, generatePodcastAudio, PodcastScriptTurn } from "../../lib/api";
 
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+type Thread = { id: string; title: string | null; updated_at: string; source_session_id: string | null; source_files: Array<{ name: string }> };
+type Turn = { speaker: string; text: string };
+type ViewState = "select" | "generating" | "listening";
 type AudioState = "idle" | "loading" | "ready" | "error";
 
+const FEATURES = [
+  { href: "/flashcard",  label: "Flash Cards", icon: "⊞" },
+  { href: "/podcast",    label: "Podcast",     icon: "🎙" },
+  { href: "/mockquiz",   label: "Mock Test",   icon: "✎" },
+  { href: "/studyguide", label: "Study Guide", icon: "≡" },
+];
+
 export default function PodcastPage() {
-  const { accessToken } = useAuth();
   const router = useRouter();
+  const { accessToken } = useAuth();
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Thread | null>(null);
+  const [view, setView] = useState<ViewState>("select");
+  const [error, setError] = useState("");
 
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [sessionFiles, setSessionFiles] = useState<Array<{ name: string }>>([]);
-
-  // Script state
+  // Script
   const [speakers, setSpeakers] = useState<[string, string]>(["Host", "Guest"]);
-  const [script, setScript] = useState<PodcastScriptTurn[]>([]);
-  const [generating, setGenerating] = useState(false);
-  const [scriptError, setScriptError] = useState("");
+  const [script, setScript] = useState<Turn[]>([]);
 
-  // Audio state
+  // Audio
   const [audioState, setAudioState] = useState<AudioState>("idle");
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [audioError, setAudioError] = useState("");
@@ -31,40 +42,63 @@ export default function PodcastPage() {
   const [duration, setDuration] = useState(0);
 
   useEffect(() => {
-    const sid = sessionStorage.getItem("pu_session_id");
-    const files = sessionStorage.getItem("pu_session_files");
-    if (sid) setSessionId(sid);
-    if (files) {
-      try { setSessionFiles(JSON.parse(files)); } catch { /* */ }
-    }
-  }, []);
+    fetch(`${BACKEND}/api/chat/threads`, {
+      credentials: "include",
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+    })
+      .then(r => r.ok ? r.json() : { threads: [] })
+      .then(d => setThreads(d.threads || []))
+      .catch(() => {});
+  }, [accessToken]);
 
-  // Cleanup audio URL on unmount
   useEffect(() => {
-    return () => {
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
-    };
+    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl); };
   }, [audioUrl]);
 
-  const onGenerateScript = useCallback(async () => {
-    if (!sessionId) return;
-    setGenerating(true);
-    setScriptError("");
+  const filtered = threads.filter(t =>
+    (t.title || "Untitled").toLowerCase().includes(query.toLowerCase())
+  );
+
+  const generate = useCallback(async (thread: Thread) => {
+    const sid = thread.source_session_id;
+    if (!sid) { setError("This chat has no uploaded content to generate from."); return; }
+    setSelected(thread);
+    setView("generating");
+    setError("");
     setScript([]);
     setAudioState("idle");
     if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
     try {
-      const result = await generatePodcast(sessionId, accessToken);
-      setScript(result.script);
-      if (result.speakers?.length >= 2) {
-        setSpeakers([result.speakers[0], result.speakers[1]]);
+      const res = await fetch(`${BACKEND}/api/generate`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ session_id: sid, output_type: "podcast" }),
+      });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Generation failed"); }
+      const data = await res.json();
+      // Support both {script: [{speaker, text}]} and {podcast_script: [...]} shapes
+      const turns: Turn[] = Array.isArray(data.script)
+        ? data.script
+        : Array.isArray(data.podcast_script)
+          ? data.podcast_script
+          : [];
+      if (!turns.length) throw new Error("No script returned. Try a different chat.");
+      if (data.speakers?.length >= 2) setSpeakers([data.speakers[0], data.speakers[1]]);
+      else {
+        const names = Array.from(new Set(turns.map((t: Turn) => t.speaker))) as string[];
+        if (names.length >= 2) setSpeakers([names[0], names[1]]);
       }
+      setScript(turns);
+      setView("listening");
     } catch (e: unknown) {
-      setScriptError(e instanceof Error ? e.message : "Script generation failed.");
-    } finally {
-      setGenerating(false);
+      setError(e instanceof Error ? e.message : "Generation failed.");
+      setView("select");
     }
-  }, [sessionId, accessToken, audioUrl]);
+  }, [audioUrl]);
 
   const onGenerateAudio = useCallback(async () => {
     if (!script.length) return;
@@ -72,7 +106,17 @@ export default function PodcastPage() {
     setAudioError("");
     if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
     try {
-      const blob = await generatePodcastAudio(speakers, script, accessToken);
+      const res = await fetch(`${BACKEND}/api/podcast/audio`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ speakers, script }),
+      });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Audio generation failed"); }
+      const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
       setAudioState("ready");
@@ -80,300 +124,262 @@ export default function PodcastPage() {
       setAudioError(e instanceof Error ? e.message : "Audio generation failed.");
       setAudioState("error");
     }
-  }, [script, speakers, accessToken, audioUrl]);
+  }, [script, speakers, audioUrl]);
 
-  // Audio controls
   const togglePlay = () => {
     const audio = audioRef.current;
     if (!audio) return;
-    if (playing) { audio.pause(); } else { audio.play(); }
-  };
-
-  const onTimeUpdate = () => {
-    const audio = audioRef.current;
-    if (audio) setCurrentTime(audio.currentTime);
-  };
-
-  const onLoadedMetadata = () => {
-    const audio = audioRef.current;
-    if (audio) setDuration(audio.duration);
-  };
-
-  const onSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    const t = parseFloat(e.target.value);
-    audio.currentTime = t;
-    setCurrentTime(t);
+    if (playing) { audio.pause(); } else { void audio.play(); }
   };
 
   const formatTime = (s: number) => {
     if (!isFinite(s)) return "0:00";
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m}:${sec.toString().padStart(2, "0")}`;
+    return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
   };
 
-  const speakerColor = (sp: string) => {
-    return sp === speakers[0]
-      ? "rgba(90,168,255,0.9)"
-      : "rgba(95,227,255,0.9)";
-  };
+  const speakerColor = (sp: string) =>
+    sp === speakers[0] ? "rgba(90,168,255,0.9)" : "rgba(95,227,255,0.9)";
 
   return (
     <>
-      <div className="pu-bg" />
-      <div className="pu-vignette" />
-      <div className="pu-root">
-        <div className="pu-shell">
-          <Sidebar />
-
-          <main className="pu-glass pu-main">
-            <div className="pu-topbar">
-              <div>
-                <div className="pu-eyebrow">Generate</div>
-                <div className="pu-pageTitle">Podcast</div>
+      <AnimatedBackground />
+      <div className="pd-root">
+        {/* ── Sidebar ── */}
+        <aside className="pd-glass pd-sidebar">
+          <div className="pd-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+          <div className="pd-sectionLabel">MAIN</div>
+          <nav className="pd-nav">
+            {FEATURES.map(f => (
+              <div key={f.href} className={`pd-navItem${f.href === "/podcast" ? " active" : ""}`} onClick={() => router.push(f.href)}>
+                <span className="pd-navIcon">{f.icon}</span>
+                <span>{f.label}</span>
               </div>
-              {script.length > 0 && (
-                <div className="pu-topActions">
-                  <span className="pu-metaChip">{script.length} turns</span>
-                  <button className="pu-btn" type="button" onClick={onGenerateScript} disabled={generating}>
-                    Regenerate script
-                  </button>
-                </div>
-              )}
+            ))}
+          </nav>
+          <button className="pd-newChat" onClick={() => router.push("/dashboard")}>
+            <span>+</span> New Chat
+          </button>
+          <div className="pd-sectionLabel" style={{ marginTop: 14 }}>RECENTS</div>
+          <input className="pd-search" placeholder="Search chats…" value={query} onChange={e => setQuery(e.target.value)} />
+          <div className="pd-list">
+            {filtered.map(t => (
+              <div key={t.id} className={`pd-thread${selected?.id === t.id ? " active" : ""}`} onClick={() => generate(t)}>
+                <div className="pd-threadTitle">{t.title || "Untitled chat"}</div>
+                <div className="pd-threadSub">{t.source_files?.map(f => f.name).join(", ") || "No files"}</div>
+              </div>
+            ))}
+            {!filtered.length && <div className="pd-empty">No chats yet. Upload content from the dashboard first.</div>}
+          </div>
+        </aside>
+
+        {/* ── Main ── */}
+        <main className="pd-glass pd-main">
+          {view === "select" && (
+            <div className="pd-centerState">
+              <div className="pd-centerIcon">🎙</div>
+              <div className="pd-centerTitle">Podcast Workspace</div>
+              <div className="pd-centerSub">Select a chat from the sidebar to generate a two-speaker podcast from your notes.</div>
+              {error && <div className="pd-error">{error}</div>}
             </div>
+          )}
 
-            <div className="pu-content">
-              {!sessionId ? (
-                <div className="pu-emptyState">
-                  <div className="pu-emptyIcon">🎙️</div>
-                  <div className="pu-emptyTitle">No study material yet</div>
-                  <div className="pu-emptySub">Upload files first to generate a podcast from your content.</div>
-                  <button className="pu-btn pu-btnPrimary" type="button" onClick={() => router.push("/upload")}>
-                    Upload Material
-                  </button>
-                </div>
-              ) : script.length === 0 ? (
-                /* Landing: no script yet */
-                <div className="pu-landingShell">
-                  <div className="pu-configCard">
-                    <div className="pu-configTitle">Generate a podcast script</div>
-                    <div className="pu-configSub">
-                      Source:{" "}
-                      {sessionFiles.length > 0
-                        ? sessionFiles.map((f) => f.name).join(", ")
-                        : "uploaded material"}
-                    </div>
-                    <div className="pu-configDesc">
-                      Creates a two-speaker conversational podcast covering your material. After the script is ready, you can convert it to MP3 audio.
-                    </div>
-                    {scriptError && <div className="pu-error">{scriptError}</div>}
-                    <button
-                      className={`pu-btn pu-btnPrimary${generating ? " pu-btnDisabled" : ""}`}
-                      disabled={generating}
-                      onClick={onGenerateScript}
-                      type="button"
-                    >
-                      {generating ? "Writing script…" : "Generate Podcast Script"}
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                /* Script ready */
-                <div className="pu-podcastShell">
-                  {/* Audio player */}
-                  <div className="pu-audioCard">
-                    {audioState === "idle" && (
-                      <div className="pu-audioIdle">
-                        <div className="pu-audioIdleText">Script ready — convert to audio</div>
-                        <button
-                          className="pu-btn pu-btnPrimary"
-                          type="button"
-                          onClick={onGenerateAudio}
-                        >
-                          🎧 Generate Audio
-                        </button>
-                      </div>
-                    )}
-
-                    {audioState === "loading" && (
-                      <div className="pu-audioLoading">
-                        <div className="pu-spinner" />
-                        <div className="pu-audioLoadingText">Synthesizing audio… this takes ~30–60s</div>
-                      </div>
-                    )}
-
-                    {audioState === "error" && (
-                      <div className="pu-audioIdle">
-                        <div className="pu-error">{audioError}</div>
-                        <button className="pu-btn" type="button" onClick={onGenerateAudio}>Retry</button>
-                      </div>
-                    )}
-
-                    {audioState === "ready" && audioUrl && (
-                      <div className="pu-player">
-                        <audio
-                          ref={audioRef}
-                          src={audioUrl}
-                          onTimeUpdate={onTimeUpdate}
-                          onLoadedMetadata={onLoadedMetadata}
-                          onPlay={() => setPlaying(true)}
-                          onPause={() => setPlaying(false)}
-                          onEnded={() => setPlaying(false)}
-                          preload="metadata"
-                        />
-                        <div className="pu-playerTop">
-                          <div className="pu-playerInfo">
-                            <div className="pu-playerTitle">Podcast</div>
-                            <div className="pu-playerSub">
-                              {speakers[0]} & {speakers[1]}
-                            </div>
-                          </div>
-                          <div className="pu-playerActions">
-                            <a
-                              href={audioUrl}
-                              download="podcast.mp3"
-                              className="pu-btn"
-                              style={{ textDecoration: "none" }}
-                            >
-                              ↓ Download
-                            </a>
-                            <button className="pu-btn" type="button" onClick={onGenerateAudio}>
-                              Regenerate
-                            </button>
-                          </div>
-                        </div>
-                        <div className="pu-playerControls">
-                          <button className="pu-playBtn" type="button" onClick={togglePlay}>
-                            {playing ? (
-                              <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22">
-                                <rect x="6" y="4" width="4" height="16" rx="1" />
-                                <rect x="14" y="4" width="4" height="16" rx="1" />
-                              </svg>
-                            ) : (
-                              <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22">
-                                <path d="M8 5.14v14l11-7-11-7z" />
-                              </svg>
-                            )}
-                          </button>
-                          <span className="pu-playerTime">{formatTime(currentTime)}</span>
-                          <input
-                            type="range"
-                            min={0}
-                            max={duration || 100}
-                            value={currentTime}
-                            onChange={onSeek}
-                            className="pu-seekBar"
-                            step={0.1}
-                          />
-                          <span className="pu-playerTime">{formatTime(duration)}</span>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Script transcript */}
-                  <div className="pu-scriptHeader">
-                    <div className="pu-scriptTitle">Script</div>
-                    <div className="pu-speakerLegend">
-                      {speakers.map((sp) => (
-                        <span key={sp} className="pu-speakerChip" style={{ borderColor: speakerColor(sp), color: speakerColor(sp) }}>
-                          {sp}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="pu-scriptBody">
-                    {script.map((turn, i) => (
-                      <div key={i} className={`pu-turn${turn.speaker === speakers[0] ? " turn-0" : " turn-1"}`}>
-                        <div className="pu-turnSpeaker" style={{ color: speakerColor(turn.speaker) }}>
-                          {turn.speaker}
-                        </div>
-                        <div className="pu-turnText">{turn.text}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+          {view === "generating" && (
+            <div className="pd-centerState">
+              <div className="pd-spinner" />
+              <div className="pd-centerTitle">Writing podcast script…</div>
+              <div className="pd-centerSub">Creating a two-speaker conversation from "{selected?.title || "your chat"}"</div>
             </div>
-          </main>
-        </div>
+          )}
+
+          {view === "listening" && script.length > 0 && (
+            <div className="pd-workspace">
+              {/* Header */}
+              <div className="pd-wsHeader">
+                <div>
+                  <div className="pd-wsEyebrow">PODCAST WORKSPACE</div>
+                  <div className="pd-wsTitle">{selected?.title || "Your notes"}</div>
+                </div>
+                <div className="pd-headerActions">
+                  <button className="pd-backBtn" onClick={() => { setView("select"); setSelected(null); setScript([]); setAudioState("idle"); }}>← Back to Chats</button>
+                </div>
+              </div>
+
+              {/* Speakers legend */}
+              <div className="pd-speakersRow">
+                {speakers.map(sp => (
+                  <div key={sp} className="pd-speakerBadge" style={{ borderColor: speakerColor(sp), color: speakerColor(sp) }}>
+                    <span className="pd-speakerDot" style={{ background: speakerColor(sp) }} />
+                    {sp}
+                  </div>
+                ))}
+                <div className="pd-metaChip">{script.length} turns</div>
+              </div>
+
+              {/* Audio player card */}
+              <div className="pd-audioCard">
+                {audioState === "idle" && (
+                  <div className="pd-audioIdle">
+                    <div className="pd-audioIdleLeft">
+                      <div className="pd-audioIdleIcon">🎧</div>
+                      <div>
+                        <div className="pd-audioIdleTitle">Script ready</div>
+                        <div className="pd-audioIdleSub">Convert this script to a real MP3 podcast with AI voices</div>
+                      </div>
+                    </div>
+                    <button className="pd-ctrlBtn pd-ctrlAccent" onClick={onGenerateAudio}>Generate Audio</button>
+                  </div>
+                )}
+                {audioState === "loading" && (
+                  <div className="pd-audioLoading">
+                    <div className="pd-spinner" style={{ width: 24, height: 24 }} />
+                    <div>
+                      <div className="pd-audioLoadTitle">Synthesizing voices…</div>
+                      <div className="pd-audioLoadSub">This usually takes 30–90 seconds</div>
+                    </div>
+                  </div>
+                )}
+                {audioState === "error" && (
+                  <div className="pd-audioIdle">
+                    <div className="pd-error" style={{ flex: 1 }}>{audioError}</div>
+                    <button className="pd-ctrlBtn" onClick={onGenerateAudio}>Retry</button>
+                  </div>
+                )}
+                {audioState === "ready" && audioUrl && (
+                  <div className="pd-player">
+                    <audio
+                      ref={audioRef}
+                      src={audioUrl}
+                      onTimeUpdate={() => { if (audioRef.current) setCurrentTime(audioRef.current.currentTime); }}
+                      onLoadedMetadata={() => { if (audioRef.current) setDuration(audioRef.current.duration); }}
+                      onPlay={() => setPlaying(true)}
+                      onPause={() => setPlaying(false)}
+                      onEnded={() => setPlaying(false)}
+                      preload="metadata"
+                    />
+                    <div className="pd-playerTop">
+                      <div>
+                        <div className="pd-playerTitle">Podcast · {speakers[0]} & {speakers[1]}</div>
+                        <div className="pd-playerSub">{script.length} turns · {formatTime(duration)}</div>
+                      </div>
+                      <div className="pd-playerBtns">
+                        <a href={audioUrl} download="podcast.mp3" className="pd-ctrlBtn" style={{ textDecoration: "none" }}>↓ Download</a>
+                        <button className="pd-ctrlBtn" onClick={onGenerateAudio}>Regenerate</button>
+                      </div>
+                    </div>
+                    <div className="pd-playerControls">
+                      <button className="pd-playBtn" onClick={togglePlay}>
+                        {playing ? (
+                          <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+                        ) : (
+                          <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M8 5.14v14l11-7-11-7z"/></svg>
+                        )}
+                      </button>
+                      <span className="pd-playerTime">{formatTime(currentTime)}</span>
+                      <input
+                        type="range" min={0} max={duration || 100} value={currentTime} step={0.1}
+                        onChange={e => { const t = parseFloat(e.target.value); if (audioRef.current) { audioRef.current.currentTime = t; } setCurrentTime(t); }}
+                        className="pd-seekBar"
+                      />
+                      <span className="pd-playerTime">{formatTime(duration)}</span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Script transcript */}
+              <div className="pd-scriptLabel">SCRIPT TRANSCRIPT</div>
+              <div className="pd-scriptBody">
+                {script.map((turn, i) => (
+                  <div key={i} className={`pd-turn${turn.speaker === speakers[0] ? " turn-a" : " turn-b"}`}>
+                    <div className="pd-turnSpeaker" style={{ color: speakerColor(turn.speaker) }}>{turn.speaker}</div>
+                    <div className="pd-turnText">{turn.text}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </main>
       </div>
 
       <style jsx>{`
-        :global(body) { margin: 0; }
-        :global(:root) {
-          --pu-bg: #07070b;
-          --pu-text: rgba(255,255,255,0.92);
-          --pu-accent-1: #5aa8ff;
-          --pu-accent-2: #5fe3ff;
-          --pu-radius-lg: 22px;
-          --pu-border: rgba(255,255,255,0.1);
-          --pu-shadow: 0 18px 60px rgba(0,0,0,0.46);
-          --pu-font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        }
-        .pu-bg { position: fixed; inset: 0; z-index: 0; background: var(--pu-bg); }
-        .pu-vignette { position: fixed; inset: 0; z-index: 1; pointer-events: none; background: radial-gradient(80% 70% at 50% 35%, rgba(90,168,255,0), rgba(0,0,0,0.55)); }
-        .pu-root { position: relative; height: 100vh; padding: 14px; overflow: hidden; color: var(--pu-text); font-family: var(--pu-font-sans); -webkit-font-smoothing: antialiased; }
-        .pu-shell { position: relative; z-index: 2; height: 100%; display: grid; grid-template-columns: 240px 1fr; gap: 14px; }
-        .pu-glass { position: relative; border-radius: var(--pu-radius-lg); border: 1px solid var(--pu-border); background: rgba(10,12,18,0.36); -webkit-backdrop-filter: blur(14px) saturate(140%); backdrop-filter: blur(14px) saturate(140%); box-shadow: var(--pu-shadow); overflow: hidden; }
-        .pu-glass::before { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 1; background: radial-gradient(60% 40% at 28% 10%, rgba(255,255,255,0.1), transparent 60%); opacity: 0.22; }
-        .pu-glass > * { position: relative; z-index: 2; }
-        .pu-main { display: flex; flex-direction: column; overflow: hidden; }
-        .pu-topbar { padding: 18px 20px; border-bottom: 1px solid rgba(255,255,255,0.06); display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-        .pu-eyebrow { font-size: 10px; font-weight: 900; letter-spacing: 0.1em; text-transform: uppercase; color: rgba(255,255,255,0.5); }
-        .pu-pageTitle { font-size: 20px; font-weight: 950; letter-spacing: -0.02em; color: rgba(255,255,255,0.94); margin-top: 4px; }
-        .pu-topActions { display: flex; align-items: center; gap: 10px; }
-        .pu-metaChip { height: 28px; padding: 0 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04); font-size: 11px; font-weight: 900; color: rgba(255,255,255,0.7); display: inline-flex; align-items: center; }
-        .pu-content { flex: 1; min-height: 0; overflow-y: auto; padding: 20px; }
-        .pu-landingShell { max-width: 520px; }
-        .pu-emptyState { text-align: center; padding: 48px 24px; }
-        .pu-emptyIcon { font-size: 40px; margin-bottom: 16px; }
-        .pu-emptyTitle { font-size: 18px; font-weight: 950; color: rgba(255,255,255,0.9); margin-bottom: 8px; }
-        .pu-emptySub { font-size: 13px; color: rgba(255,255,255,0.6); line-height: 1.6; margin-bottom: 20px; }
-        .pu-configCard { padding: 28px; border-radius: var(--pu-radius-lg); border: 1px solid rgba(255,255,255,0.1); background: rgba(10,12,18,0.3); display: flex; flex-direction: column; gap: 16px; }
-        .pu-configTitle { font-size: 18px; font-weight: 950; color: rgba(255,255,255,0.94); }
-        .pu-configSub { font-size: 13px; color: rgba(255,255,255,0.6); }
-        .pu-configDesc { font-size: 13px; color: rgba(255,255,255,0.65); line-height: 1.6; }
-        .pu-error { font-size: 13px; color: #ff6b6b; padding: 12px 16px; border-radius: 14px; border: 1px solid rgba(255,107,107,0.2); background: rgba(255,107,107,0.06); }
-        .pu-podcastShell { display: flex; flex-direction: column; gap: 20px; max-width: 680px; }
+        :global(body){margin:0;background:#07070b;}
+        .pd-root{position:relative;z-index:1;display:grid;grid-template-columns:240px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
+        .pd-glass{border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.5);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+        .pd-sidebar{padding:16px;display:flex;flex-direction:column;min-height:0;overflow:hidden;}
+        .pd-main{overflow-y:auto;padding:0;}
+        .pd-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:14px;}
+        .pd-sectionLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;}
+        .pd-nav{display:flex;flex-direction:column;gap:4px;}
+        .pd-navItem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:700;color:rgba(255,255,255,0.75);transition:all 130ms;}
+        .pd-navItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.08);}
+        .pd-navItem.active{background:rgba(255,255,255,0.06);border-color:rgba(95,227,255,0.25);color:rgba(255,255,255,0.95);}
+        .pd-navIcon{font-size:14px;width:18px;text-align:center;}
+        .pd-search{margin-top:4px;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;font-size:12px;color:rgba(255,255,255,0.85);outline:none;}
+        .pd-search::placeholder{color:rgba(255,255,255,0.35);}
+        .pd-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
+        .pd-thread{padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.02);cursor:pointer;transition:all 130ms;}
+        .pd-thread:hover{background:rgba(255,255,255,0.05);border-color:rgba(95,227,255,0.18);}
+        .pd-thread.active{border-color:rgba(95,227,255,0.3);background:rgba(95,227,255,0.06);}
+        .pd-threadTitle{font-size:12px;font-weight:800;color:rgba(255,255,255,0.88);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .pd-threadSub{font-size:10px;color:rgba(255,255,255,0.42);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .pd-empty{font-size:12px;color:rgba(255,255,255,0.4);padding:12px 0;text-align:center;line-height:1.5;}
+        .pd-newChat{width:100%;margin-top:10px;height:36px;border-radius:12px;border:1px dashed rgba(255,255,255,0.18);background:rgba(255,255,255,0.03);color:rgba(255,255,255,0.72);font-size:12px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all 130ms;}
+        .pd-newChat:hover{background:rgba(95,227,255,0.06);border-color:rgba(95,227,255,0.35);color:rgba(255,255,255,0.92);}
+        /* Center states */
+        .pd-centerState{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;padding:40px;text-align:center;}
+        .pd-centerIcon{font-size:48px;line-height:1;}
+        .pd-centerTitle{font-size:22px;font-weight:950;letter-spacing:-0.02em;color:rgba(255,255,255,0.94);}
+        .pd-centerSub{font-size:14px;color:rgba(255,255,255,0.55);line-height:1.6;max-width:420px;}
+        .pd-error{font-size:13px;color:#ff6b6b;padding:10px 16px;border-radius:12px;border:1px solid rgba(255,107,107,0.2);background:rgba(255,107,107,0.07);}
+        .pd-spinner{width:36px;height:36px;border-radius:50%;border:3px solid rgba(255,255,255,0.1);border-top-color:#5aa8ff;animation:spin 0.8s linear infinite;flex-shrink:0;}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        /* Workspace */
+        .pd-workspace{padding:24px;display:flex;flex-direction:column;gap:18px;}
+        .pd-wsHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+        .pd-wsEyebrow{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.45);}
+        .pd-wsTitle{font-size:20px;font-weight:950;letter-spacing:-0.02em;color:rgba(255,255,255,0.94);margin-top:4px;}
+        .pd-headerActions{flex-shrink:0;}
+        .pd-backBtn{height:34px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.8);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;}
+        .pd-backBtn:hover{background:rgba(255,255,255,0.07);}
+        /* Speakers */
+        .pd-speakersRow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+        .pd-speakerBadge{display:flex;align-items:center;gap:6px;height:28px;padding:0 12px;border-radius:999px;border:1px solid;font-size:11px;font-weight:900;}
+        .pd-speakerDot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+        .pd-metaChip{height:28px;padding:0 12px;border-radius:999px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);font-size:11px;font-weight:700;color:rgba(255,255,255,0.55);display:inline-flex;align-items:center;}
         /* Audio card */
-        .pu-audioCard { border-radius: 18px; border: 1px solid rgba(255,255,255,0.1); background: rgba(10,12,18,0.4); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); overflow: hidden; }
-        .pu-audioIdle { padding: 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-        .pu-audioIdleText { font-size: 13px; color: rgba(255,255,255,0.72); font-weight: 700; }
-        .pu-audioLoading { padding: 20px; display: flex; align-items: center; gap: 14px; }
-        .pu-spinner { width: 22px; height: 22px; border: 2px solid rgba(255,255,255,0.1); border-top-color: #5fe3ff; border-radius: 999px; animation: spin 0.8s linear infinite; flex-shrink: 0; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .pu-audioLoadingText { font-size: 13px; color: rgba(255,255,255,0.7); }
-        .pu-player { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
-        .pu-playerTop { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-        .pu-playerInfo {}
-        .pu-playerTitle { font-size: 15px; font-weight: 900; color: rgba(255,255,255,0.92); }
-        .pu-playerSub { font-size: 12px; color: rgba(255,255,255,0.55); margin-top: 2px; }
-        .pu-playerActions { display: flex; gap: 8px; }
-        .pu-playerControls { display: flex; align-items: center; gap: 12px; }
-        .pu-playBtn { width: 42px; height: 42px; border-radius: 999px; background: linear-gradient(135deg, #5aa8ff, #5fe3ff); border: none; display: grid; place-items: center; cursor: pointer; color: rgba(0,0,0,0.9); flex-shrink: 0; transition: transform 140ms; }
-        .pu-playBtn:hover { transform: scale(1.06); }
-        .pu-playerTime { font-size: 11px; font-weight: 900; color: rgba(255,255,255,0.55); white-space: nowrap; min-width: 34px; }
-        .pu-seekBar { flex: 1; height: 4px; -webkit-appearance: none; appearance: none; background: rgba(255,255,255,0.12); border-radius: 999px; outline: none; cursor: pointer; accent-color: #5fe3ff; }
+        .pd-audioCard{border-radius:18px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.45);overflow:hidden;}
+        .pd-audioIdle{padding:18px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;}
+        .pd-audioIdleLeft{display:flex;align-items:center;gap:14px;}
+        .pd-audioIdleIcon{font-size:28px;flex-shrink:0;}
+        .pd-audioIdleTitle{font-size:14px;font-weight:900;color:rgba(255,255,255,0.9);}
+        .pd-audioIdleSub{font-size:12px;color:rgba(255,255,255,0.5);margin-top:2px;}
+        .pd-audioLoading{padding:18px 20px;display:flex;align-items:center;gap:14px;}
+        .pd-audioLoadTitle{font-size:13px;font-weight:900;color:rgba(255,255,255,0.85);}
+        .pd-audioLoadSub{font-size:11px;color:rgba(255,255,255,0.5);margin-top:2px;}
+        /* Player */
+        .pd-player{padding:16px 20px;display:flex;flex-direction:column;gap:14px;}
+        .pd-playerTop{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+        .pd-playerTitle{font-size:14px;font-weight:900;color:rgba(255,255,255,0.9);}
+        .pd-playerSub{font-size:11px;color:rgba(255,255,255,0.5);margin-top:2px;}
+        .pd-playerBtns{display:flex;gap:8px;}
+        .pd-playerControls{display:flex;align-items:center;gap:12px;}
+        .pd-playBtn{width:42px;height:42px;border-radius:999px;background:linear-gradient(135deg,#5aa8ff,#5fe3ff);border:none;display:grid;place-items:center;cursor:pointer;color:rgba(0,0,0,0.9);flex-shrink:0;transition:transform 140ms;}
+        .pd-playBtn:hover{transform:scale(1.07);}
+        .pd-playerTime{font-size:11px;font-weight:800;color:rgba(255,255,255,0.5);white-space:nowrap;min-width:34px;}
+        .pd-seekBar{flex:1;height:4px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.12);border-radius:999px;outline:none;cursor:pointer;accent-color:#5fe3ff;}
         /* Script */
-        .pu-scriptHeader { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-        .pu-scriptTitle { font-size: 13px; font-weight: 900; letter-spacing: 0.05em; text-transform: uppercase; color: rgba(255,255,255,0.5); }
-        .pu-speakerLegend { display: flex; gap: 8px; }
-        .pu-speakerChip { height: 26px; padding: 0 12px; border-radius: 999px; border: 1px solid; font-size: 11px; font-weight: 900; display: inline-flex; align-items: center; }
-        .pu-scriptBody { display: flex; flex-direction: column; gap: 12px; }
-        .pu-turn { padding: 14px 16px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.03); }
-        .pu-turn.turn-0 { border-color: rgba(90,168,255,0.12); background: rgba(90,168,255,0.04); }
-        .pu-turn.turn-1 { border-color: rgba(95,227,255,0.1); background: rgba(95,227,255,0.03); }
-        .pu-turnSpeaker { font-size: 10px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
-        .pu-turnText { font-size: 14px; line-height: 1.65; color: rgba(255,255,255,0.88); }
-        .pu-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 40px; padding: 0 18px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.92); font-size: 12px; font-weight: 900; cursor: pointer; transition: transform 160ms ease, background 160ms ease; white-space: nowrap; }
-        .pu-btn:hover { transform: translateY(-1px); background: rgba(255,255,255,0.06); border-color: rgba(95,227,255,0.22); }
-        .pu-btnPrimary { background: linear-gradient(90deg, rgba(90,168,255,0.95), rgba(95,227,255,0.95)); color: rgba(0,0,0,0.9); border-color: transparent; }
-        .pu-btnDisabled { opacity: 0.4; cursor: not-allowed; transform: none !important; }
-        @media (max-width: 720px) { .pu-shell { grid-template-columns: 1fr; } }
+        .pd-scriptLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);}
+        .pd-scriptBody{display:flex;flex-direction:column;gap:10px;}
+        .pd-turn{padding:14px 18px;border-radius:16px;border:1px solid rgba(255,255,255,0.07);background:rgba(255,255,255,0.025);}
+        .pd-turn.turn-a{border-color:rgba(90,168,255,0.14);background:rgba(90,168,255,0.045);}
+        .pd-turn.turn-b{border-color:rgba(95,227,255,0.11);background:rgba(95,227,255,0.03);}
+        .pd-turnSpeaker{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;}
+        .pd-turnText{font-size:14px;line-height:1.65;color:rgba(255,255,255,0.88);}
+        /* Buttons */
+        .pd-ctrlBtn{display:inline-flex;align-items:center;justify-content:center;height:38px;padding:0 16px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.85);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;white-space:nowrap;text-decoration:none;}
+        .pd-ctrlBtn:hover{background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);transform:translateY(-1px);}
+        .pd-ctrlAccent{background:linear-gradient(90deg,rgba(90,168,255,0.9),rgba(95,227,255,0.9));color:rgba(0,0,0,0.85);border-color:transparent;}
+        @media(max-width:700px){.pd-root{grid-template-columns:1fr;}.pd-sidebar{display:none;}}
       `}</style>
     </>
   );
