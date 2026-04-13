@@ -2055,7 +2055,7 @@ const uploadToBackend = async () => {
 
         .pu-root {
           position: relative;
-          height: 100vh;
+          height: 100dvh;
           padding: 14px;
           overflow: hidden;
           color: var(--pu-text);
@@ -2084,7 +2084,7 @@ const uploadToBackend = async () => {
           z-index: 2;
           height: 100%;
           display: grid;
-          grid-template-columns: 340px 1fr;
+          grid-template-columns: 340px minmax(0, 1fr);
           gap: 14px;
           min-width: 0;
         }
@@ -2186,6 +2186,8 @@ const uploadToBackend = async () => {
           display: flex;
           flex-direction: column;
           min-height: 0;
+          max-height: calc(100dvh - 28px);
+          min-width: 0;
         }
 
         .pu-brandRow {
@@ -2324,6 +2326,7 @@ const uploadToBackend = async () => {
           gap: 10px;
           overflow: auto;
           min-height: 0;
+          max-height: calc(100dvh - 360px);
           padding-right: 6px;
           scrollbar-gutter: stable;
         }
@@ -2360,6 +2363,8 @@ const uploadToBackend = async () => {
           flex-direction: column;
           overflow: hidden;
           min-width: 0;
+          min-height: 0;
+          height: 100%;
         }
 
         .pu-topbar {
@@ -2369,6 +2374,7 @@ const uploadToBackend = async () => {
           justify-content: space-between;
           gap: 12px;
           border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+          flex-wrap: wrap;
         }
 
         .pu-userChip {
@@ -2412,9 +2418,11 @@ const uploadToBackend = async () => {
         .pu-content {
           flex: 1;
           min-height: 0;
-          overflow: hidden;
+          overflow: auto;
           padding: 14px;
           position: relative;
+          min-width: 0;
+          height: 100%;
         }
 
         /* ===== Upload view (home-like glossy card) ===== */
@@ -2435,6 +2443,7 @@ const uploadToBackend = async () => {
           box-shadow: var(--pu-shadow);
           position: relative;
           overflow: hidden;
+          min-width: 0;
         }
 
         .pu-uploadCard::before {
@@ -2453,14 +2462,15 @@ const uploadToBackend = async () => {
           z-index: 1;
         }
 
-        .pu-titleRow {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          margin-bottom: 12px;
-          flex-wrap: wrap;
-        }
+      .pu-titleRow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 12px;
+        flex-wrap: wrap;
+        min-width: 0;
+      }
 
         .pu-h1 {
           font-size: 14px;
@@ -2557,6 +2567,7 @@ const uploadToBackend = async () => {
         }
 
         .pu-fileName {
+
           font-size: 12px;
           font-weight: 900;
           color: rgba(255, 255, 255, 0.90);
@@ -2857,13 +2868,136 @@ const uploadToBackend = async () => {
         }
 
         @media (max-width: 980px) {
+          .pu-root {
+            height: auto;
+            min-height: 100dvh;
+            padding: 10px;
+            overflow-x: hidden;
+            overflow-y: auto;
+          }
+
           .pu-shell {
             grid-template-columns: 1fr;
+            height: auto;
           }
+
+          .pu-main {
+            order: 1;
+            min-height: 0;
+            height: auto;
+          }
+
           .pu-sidebar {
-            display: none;
+            order: 2;
+            display: flex;
+            max-height: none;
+          }
+
+          .pu-sideNav {
+            flex-direction: row;
+            overflow-x: auto;
+            padding-bottom: 4px;
+          }
+
+          .pu-sideItem {
+            min-width: 170px;
+            flex-shrink: 0;
+          }
+
+          .pu-list {
+            max-height: 220px;
+          }
+
+          .pu-content {
+            height: auto;
+          }
+
+          .pu-uploadCenter {
+            height: auto;
+            display: block;
+          }
+
+          .pu-uploadCard {
+            width: 100%;
           }
         }
+
+          @media (max-width: 720px) {
+          .pu-root {
+            padding: 8px;
+          }
+
+          .pu-content,
+          .pu-topbar,
+          .pu-sidebar {
+            padding: 12px;
+          }
+
+          .pu-brand {
+            font-size: 13px;
+          }
+
+          .pu-sideNav {
+            gap: 8px;
+          }
+
+          .pu-sideItem {
+            min-width: 150px;
+            padding: 10px 12px;
+          }
+
+          .pu-sideLabel,
+          .pu-itemTitle,
+          .pu-search input,
+          .pu-userName {
+            font-size: 12px;
+          }
+
+          .pu-userHint,
+          .pu-itemSub,
+          .pu-sectionLabel {
+            font-size: 10px;
+          }
+
+          .pu-uploadCard {
+            padding: 14px;
+          }
+
+          .pu-titleRow {
+            align-items: stretch;
+          }
+
+          .pu-btn,
+          .pu-search {
+            width: 100%;
+          }
+        }
+        @media (max-width: 520px) {
+        .pu-root {
+          padding: 6px;
+        }
+
+        .pu-content,
+        .pu-topbar,
+        .pu-sidebar,
+        .pu-uploadCard {
+          padding: 10px;
+        }
+
+        .pu-sideItem {
+          min-width: 138px;
+        }
+
+        .pu-userChip {
+          width: 100%;
+          justify-content: space-between;
+        }
+
+        .pu-titleRow,
+        .pu-brandRow {
+          gap: 8px;
+        }
+      }
       `}</style>
 
       <div className="pu-shell">
