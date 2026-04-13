@@ -77,6 +77,39 @@ async def _bot_is_in_guild(guild_id: str) -> bool:
     raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
 
+async def _guild_with_bot_status(g: Dict[str, Any]) -> Dict[str, Any]:
+    """Return one simplified guild payload including whether the bot is already installed."""
+    perms = g.get("permissions")
+    guild_id = g.get("id")
+    is_owner = bool(g.get("owner"))
+    can_manage = _can_manage_guild(perms) or is_owner
+    installed = False
+
+    if guild_id:
+        try:
+            await asyncio.sleep(0.15)  # throttle to avoid rate limits
+            installed = await _bot_is_in_guild(guild_id)
+        except HTTPException:
+            installed = False
+
+    if installed:
+        setup_status = "connected"
+    elif can_manage:
+        setup_status = "can_install"
+    else:
+        setup_status = "needs_admin"
+
+    return {
+        "id": guild_id,
+        "name": g.get("name"),
+        "owner": is_owner,
+        "permissions": perms,
+        "can_manage": can_manage,
+        "installed": installed,
+        "setup_status": setup_status,
+    }
+
+
 async def _post_form_with_retries(url: str, data: Dict[str, Any], headers: Dict[str, str], *, max_retries: int = 5):
     """POST x-www-form-urlencoded with basic retry/backoff for Discord rate limits."""
     backoff = 1.0
@@ -227,17 +260,16 @@ async def discord_guilds(request: Request):
     guilds = await _discord_api_get(access, "/users/@me/guilds")
 
     simplified = []
-    for g in (guilds or []):
-        perms = g.get("permissions")
-        simplified.append(
-            {
-                "id": g.get("id"),
-                "name": g.get("name"),
-                "owner": g.get("owner"),
-                "permissions": perms,
-                "can_manage": _can_manage_guild(perms) or bool(g.get("owner")),
-            }
+    for g in (guilds or [])[:25]:  # limit to first 25 servers to avoid rate limits
+        result = await _guild_with_bot_status(g)
+        simplified.append(result)
+    simplified.sort(
+        key=lambda g: (
+            0 if g.get("installed") else 1,
+            0 if g.get("can_manage") else 1,
+            (g.get("name") or "").lower(),
         )
+    )
     return JSONResponse({"guilds": simplified})
 
 
