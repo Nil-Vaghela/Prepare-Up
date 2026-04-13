@@ -1,7 +1,6 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import Response
 import os
 import uuid
 
@@ -19,6 +18,10 @@ from app.api.discord_integration import router as discord_router
 from app.api.auth import router as auth_router
 
 app = FastAPI(title=settings.APP_NAME)
+
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").strip().lower() in {"1", "true", "yes", "on"}
+COOKIE_DOMAIN = (os.getenv("COOKIE_DOMAIN") or "").strip() or None
+ANON_COOKIE_MAX_AGE = 60 * 60 * 24 * 30
 
 # CORS: must allow credentials for cookies to work from 3000 -> 8000
 app.add_middleware(
@@ -45,22 +48,26 @@ app.add_middleware(
 # Anonymous ownership cookie (used for anon chat + claim-on-login)
 @app.middleware("http")
 async def ensure_anon_session(request: Request, call_next):
-    sid = request.cookies.get("pu_session_id")
+    sid = (request.cookies.get("pu_session_id") or "").strip()
     response: Response = await call_next(request)
 
-    if not sid:
-        new_sid = str(uuid.uuid4())
-        response.set_cookie(
-            key="pu_session_id",
-            value=new_sid,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            path="/",
-            domain="localhost",
-            max_age=60 * 60 * 24 * 30,
-        )
+    if sid:
+        return response
 
+    new_sid = str(uuid.uuid4())
+    cookie_kwargs = {
+        "key": "pu_session_id",
+        "value": new_sid,
+        "httponly": True,
+        "samesite": "lax",
+        "secure": COOKIE_SECURE,
+        "path": "/",
+        "max_age": ANON_COOKIE_MAX_AGE,
+    }
+    if COOKIE_DOMAIN:
+        cookie_kwargs["domain"] = COOKIE_DOMAIN
+
+    response.set_cookie(**cookie_kwargs)
     return response
 
 # Routers

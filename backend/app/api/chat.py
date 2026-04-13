@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -60,6 +58,17 @@ messages_tbl = Table(
     Column("content", Text, nullable=False),
     Column("meta", JSON, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
+)
+
+session_sources = Table(
+    "chat_session_sources",
+    _METADATA,
+    Column("session_id", String(128), primary_key=True),
+    Column("owner_user_id", String(128), nullable=True),
+    Column("owner_anon_id", String(128), nullable=True),
+    Column("content", Text, nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
 )
 
 
@@ -131,6 +140,14 @@ def _get_owner_ids(request: Request) -> tuple[str | None, str | None]:
             owner_user_id = str(sub).strip()
 
     return owner_user_id, anon_id
+
+def _require_owner(request: Request) -> tuple[str | None, str | None]:
+    owner_user_id, owner_anon_id = _get_owner_ids(request)
+    if not owner_user_id and not owner_anon_id:
+        raise HTTPException(status_code=401, detail="No user or anonymous session found.")
+    return owner_user_id, owner_anon_id
+
+
 
 
 def _ensure_conversation(
@@ -227,34 +244,61 @@ def _replace_messages(engine, conversation_id: str, messages: list[dict[str, Any
             conversations.update().where(conversations.c.id == conversation_id).values(updated_at=now)
         )
 
+def _store_session_text(
+    engine,
+    session_id: str,
+    content: str,
+    owner_user_id: Optional[str],
+    owner_anon_id: Optional[str],
+):
+    now = _now()
+    with engine.begin() as conn:
+        existing = conn.execute(
+            select(session_sources.c.session_id).where(session_sources.c.session_id == session_id)
+        ).first()
 
-TMP_DIR = Path("/tmp/prepareup_sessions")
-SESSION_TTL_SECONDS = 60 * 30
+        values = {
+            "owner_user_id": owner_user_id,
+            "owner_anon_id": owner_anon_id,
+            "content": content,
+            "updated_at": now,
+        }
+
+        if existing is None:
+            conn.execute(
+                session_sources.insert().values(
+                    session_id=session_id,
+                    owner_user_id=owner_user_id,
+                    owner_anon_id=owner_anon_id,
+                    content=content,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            conn.execute(
+                session_sources.update()
+                .where(session_sources.c.session_id == session_id)
+                .values(**values)
+            )
 
 
 def _read_session_text(session_id: str) -> str:
-    p = TMP_DIR / f"{session_id}.txt"
-    if not p.exists():
+    engine = _require_engine()
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(session_sources.c.content).where(session_sources.c.session_id == session_id)
+        ).mappings().first()
+
+    if row is None:
         raise HTTPException(status_code=404, detail="Session not found or expired.")
 
-    raw = p.read_text(encoding="utf-8")
-    first_nl = raw.find("\n")
-    if first_nl == -1:
-        raise HTTPException(status_code=500, detail="Corrupt session store.")
+    content = str(row.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=404, detail="Session not found or expired.")
 
-    try:
-        created_ts = int(raw[:first_nl])
-    except Exception:
-        raise HTTPException(status_code=500, detail="Corrupt session timestamp.")
-
-    if (int(time.time()) - created_ts) > SESSION_TTL_SECONDS:
-        try:
-            p.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise HTTPException(status_code=404, detail="Session expired.")
-
-    return raw[first_nl + 1 :]
+    return content
 
 
 class ChatTurn(BaseModel):
@@ -315,9 +359,7 @@ def chat(req: ChatRequest, request: Request):
     conversation_id = (req.thread_id or "").strip() or str(uuid.uuid4())
     title = (req.thread_title or "").strip() or None
 
-    owner_user_id, owner_anon_id = _get_owner_ids(request)
-    if not owner_user_id and not owner_anon_id:
-        raise HTTPException(status_code=401, detail="No user or anonymous session found.")
+    owner_user_id, owner_anon_id = _require_owner(request)
 
     _ensure_conversation(
         engine,
@@ -408,7 +450,7 @@ def list_threads(request: Request):
     if engine is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL is not set; cannot persist chats to the database.")
 
-    owner_user_id, owner_anon_id = _get_owner_ids(request)
+    owner_user_id, owner_anon_id = _require_owner(request)
 
     with engine.begin() as conn:
         q = select(
@@ -434,7 +476,7 @@ def list_threads(request: Request):
                 "id": r.id,
                 "title": r.title,
                 "updated_at": r.updated_at.isoformat(),
-                "source_session_id": r.source_session_id,
+                "source_session_id": r.source_session_id, 
                 "source_files": r.source_files or [],
                 "combined_text_len": int(r.combined_text_len) if r.combined_text_len not in (None, "") else 0,
             }
@@ -446,9 +488,7 @@ def list_threads(request: Request):
 @router.get("/chat/threads/{thread_id}")
 def get_thread(thread_id: str, request: Request):
     engine = _require_engine()
-    owner_user_id, owner_anon_id = _get_owner_ids(request)
-    if not owner_user_id and not owner_anon_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    owner_user_id, owner_anon_id = _require_owner(request)
 
     with engine.begin() as conn:
         convo = conn.execute(
@@ -514,7 +554,7 @@ def claim(request: Request):
     if engine is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL is not set; cannot persist chats to the database.")
 
-    owner_user_id, owner_anon_id = _get_owner_ids(request)
+    owner_user_id, owner_anon_id = _require_owner(request)
 
     if not owner_user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -536,19 +576,6 @@ def claim(request: Request):
     return {"ok": True, "claimed": claimed}
 
 
-class SyncMessage(BaseModel):
-    role: Literal["user", "ai"]
-    content: str = Field(min_length=1, max_length=50_000)
-
-
-class ChatSyncRequest(BaseModel):
-    session_id: str
-    thread_id: Optional[str] = None
-    thread_title: Optional[str] = None
-    messages: list[SyncMessage] = Field(default_factory=list)
-    source_session_id: Optional[str] = None
-    source_files: list[dict[str, Any]] = Field(default_factory=list)
-    combined_text_len: Optional[int] = None
 
 
 @router.post("/chat/sync")
@@ -560,7 +587,7 @@ def sync_chat(req: ChatSyncRequest, request: Request):
     conversation_id = (req.thread_id or "").strip() or str(uuid.uuid4())
     title = (req.thread_title or "").strip() or None
 
-    owner_user_id, owner_anon_id = _get_owner_ids(request)
+    owner_user_id, owner_anon_id = _require_owner(request)
     _ensure_conversation(
         engine,
         conversation_id,

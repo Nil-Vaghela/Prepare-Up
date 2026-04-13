@@ -1,31 +1,21 @@
 from __future__ import annotations
 
-import time
 import uuid
-from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 
+from app.api.chat import _require_engine, _require_owner, _store_session_text
 from app.core.extractors import extract_text_any
 
 router = APIRouter()
 
 MAX_FILES = 20
 MAX_BYTES_PER_FILE = 25 * 1024 * 1024  # 25MB
-SESSION_TTL_SECONDS = 60 * 30  # 30 minutes
-TMP_DIR = Path("/tmp/prepareup_sessions")
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-
-def _session_path(session_id: str) -> Path:
-    return TMP_DIR / f"{session_id}.txt"
-
-def _write_session_text(session_id: str, text: str) -> None:
-    payload = f"{int(time.time())}\n{text}"
-    _session_path(session_id).write_text(payload, encoding="utf-8")
+SESSION_TTL_SECONDS = 60 * 60 * 24 * 30  # informational only; session text is stored in DB
 
 @router.post("/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(request: Request, files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
     if len(files) > MAX_FILES:
@@ -91,7 +81,17 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
     session_id = str(uuid.uuid4())
     try:
-        _write_session_text(session_id, combined_text)
+        engine = _require_engine()
+        owner_user_id, owner_anon_id = _require_owner(request)
+        _store_session_text(
+            engine,
+            session_id,
+            combined_text,
+            owner_user_id,
+            owner_anon_id,
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to store session text: {e}")
 

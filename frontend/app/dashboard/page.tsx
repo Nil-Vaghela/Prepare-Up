@@ -168,6 +168,7 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [selectedOutput, setSelectedOutput] = useState<OutputType | null>(null);
+  const [sourceExpired, setSourceExpired] = useState("");
     // Auth
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
@@ -225,6 +226,68 @@ export default function DashboardPage() {
 
   const effectiveSessionId = sessionId || activeSession?.backendSessionId || null;
   const canChatInCurrentThread = !!effectiveSessionId;
+
+  const extractErrorText = (raw: string) => {
+    const text = (raw || "").trim();
+    if (!text) return "";
+
+    try {
+      const parsed = JSON.parse(text);
+      if (typeof parsed?.detail === "string") return parsed.detail;
+      if (typeof parsed?.message === "string") return parsed.message;
+      if (typeof parsed?.error === "string") return parsed.error;
+    } catch {
+      // plain text response; ignore
+    }
+
+    return text;
+  };
+
+  const isExpiredSourceError = (status: number, body: string) => {
+    if (status !== 404 && status !== 400) return false;
+    const msg = extractErrorText(body).toLowerCase();
+    return (
+      msg.includes("session expired") ||
+      msg.includes("session not found") ||
+      msg.includes("not found or expired") ||
+      msg.includes("source expired") ||
+      msg.includes("expired")
+    );
+  };
+
+  const markSourceExpired = (detail?: string) => {
+    const text =
+      detail ||
+      "This chat history was restored, but the original uploaded source expired. Re-upload your files to continue generating or chatting.";
+
+    setSourceExpired(text);
+    setSessionId(null);
+    setSelectedOutput(null);
+    setSidebarActive(null);
+
+    const nextMessages = (() => {
+      const already = messages.some((m) => m.role === "ai" && m.title === "Source expired");
+      if (already) return messages;
+
+      return [
+        ...messages,
+        {
+          id: crypto.randomUUID(),
+          role: "ai" as const,
+          title: "Source expired",
+          text,
+        },
+      ];
+    })();
+
+    setMessages(nextMessages);
+    upsertActiveSession({
+      backendSessionId: null,
+      selectedOutput: null,
+      messages: nextMessages,
+    });
+  };
+  
   const setActiveChatIdSync = (id: string | null) => {
     activeChatIdRef.current = id;
     setActiveChatId(id);
@@ -279,6 +342,7 @@ export default function DashboardPage() {
     setMessages([]);
     setChatInput("");
     setSelectedOutput(null);
+    setSourceExpired("");
 
     setSidebarActive(null);
     setRecentQuery("");
@@ -417,6 +481,7 @@ export default function DashboardPage() {
       const loaded = await loadThreadMessages(s.id);
       if (loaded) {
         const restoredSessionId = loaded.backendSessionId || s.backendSessionId || null;
+        setSourceExpired("");
         setSessionId(restoredSessionId);
         setUploaded(loaded.uploaded);
         setCombinedTextLen(loaded.combinedTextLen);
@@ -454,6 +519,7 @@ export default function DashboardPage() {
     setUploaded(s.uploaded);
     setCombinedTextLen(s.combinedTextLen);
     setSessionId(s.backendSessionId || null);
+    setSourceExpired("");
 
     setSelectedOutput(s.selectedOutput);
     setSidebarActive(
@@ -520,6 +586,46 @@ export default function DashboardPage() {
       );
     });
   };
+
+  const canContinue = files.length > 0 && !uploading;
+  const composerPlaceholder = sourceExpired
+    ? "Source expired — re-upload files to continue..."
+    : canChatInCurrentThread
+    ? "Ask for changes, add sections, shorten, format, etc..."
+    : "Pick Podcast / Study Guide / Narrative / Flash Card to start...";
+  const shouldShowOutputPicker = useMemo(() => {
+  if (view !== "chat") return false;
+  if (selectedOutput) return false;
+  if (!messages.length) return false;
+
+  const meaningful = messages.filter(
+    (m) =>
+      !m.loading &&
+      [m.title, m.meta, m.text]
+        .filter(Boolean)
+        .join("\n")
+        .trim().length > 0
+  );
+
+  const hasWelcome = meaningful.some(
+    (m) =>
+      m.role === "ai" &&
+      (((m.title || "").trim() === "Welcome") ||
+        /Pick an output above to generate first/i.test(m.text || ""))
+  );
+  if (!hasWelcome) return false;
+
+  const nonWelcomeMessages = meaningful.filter(
+    (m) =>
+      !(
+        m.role === "ai" &&
+        (((m.title || "").trim() === "Welcome") ||
+          /Pick an output above to generate first/i.test(m.text || ""))
+      )
+  );
+
+  return nonWelcomeMessages.length <= 1;
+}, [view, selectedOutput, messages]);
 
   // -----------------------------
   // Discord integration
@@ -1666,8 +1772,14 @@ const uploadToBackend = async () => {
 
     const data = await res.json();
 
-    const sid = typeof data.session_id === "string" ? data.session_id : null;
-    if (sid) setSessionId(sid);
+      // Support both backend response shapes:
+      // Old: { files, combined_text, combined_len }
+      // New: { session_id, files, preview, preview_len, ttl_seconds }
+      const sid = typeof data.session_id === "string" ? data.session_id : null;
+      if (sid) {
+        setSessionId(sid);
+        setSourceExpired("");
+      }
 
     const normalized: UploadedFile[] = (data.files || []).map((f: any) => {
       const name = f.name || f.filename || "unknown";
@@ -1809,7 +1921,11 @@ const uploadToBackend = async () => {
     if (generating) return;
     const resolvedSessionId = effectiveSessionId;
     if (!resolvedSessionId) {
-      alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
+      if (messages.length > 0) {
+        markSourceExpired();
+      } else {
+        alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
+      }
       return;
     }
     setSelectedOutput(k);
@@ -1849,7 +1965,11 @@ const uploadToBackend = async () => {
       });
 
       if (!res.ok) {
-        const msg = await res.text();
+        const raw = await res.text();
+        const msg = extractErrorText(raw);
+        if (isExpiredSourceError(res.status, raw)) {
+          markSourceExpired(msg || undefined);
+        }
         throw new Error(msg || "Generate failed");
       }
 
@@ -1899,7 +2019,11 @@ const uploadToBackend = async () => {
     if (!text || generating) return;
     const resolvedSessionId = effectiveSessionId;
     if (!resolvedSessionId) {
-      alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
+      if (messages.length > 0) {
+        markSourceExpired();
+      } else {
+        alert("Upload files first (or connect Discord) so I have context. Then you can chat.");
+      }
       return;
     }
 
@@ -1939,7 +2063,11 @@ const uploadToBackend = async () => {
       });
 
       if (!res.ok) {
-        const msg = await res.text();
+        const raw = await res.text();
+        const msg = extractErrorText(raw);
+        if (isExpiredSourceError(res.status, raw)) {
+          markSourceExpired(msg || undefined);
+        }
         throw new Error(msg || "Chat failed");
       }
 
