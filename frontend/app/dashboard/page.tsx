@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import * as THREE from "three";
 
@@ -36,6 +37,8 @@ type UploadedFile = {
 type OutputType = "podcast" | "study_guide" | "narrative" | "flash_card";
 type ChatRole = "user" | "ai";
 
+type PodcastTurn = { speaker: string; text: string };
+
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -43,6 +46,15 @@ type ChatMessage = {
   meta?: string;
   text: string;
   loading?: boolean;
+  // Rich output fields
+  outputType?: OutputType;
+  // podcast
+  podcastSpeakers?: [string, string];
+  podcastScript?: PodcastTurn[];
+  audioUrl?: string;
+  audioLoading?: boolean;
+  // flashcards
+  flashCards?: Array<{ front: string; back: string }>;
 };
 
 type ChatSession = {
@@ -95,7 +107,8 @@ function isAllowed(file: File) {
 }
 
 export default function DashboardPage() {
-  // Sidebar is NOT a router. It only offers generation modes.
+  const router = useRouter();
+
   // Helper to build Authorization headers if accessToken exists
   const authHeaders = () => {
     const h: Record<string, string> = {};
@@ -107,39 +120,13 @@ export default function DashboardPage() {
   );
 
   const onSidebarSelect = (key: "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
-    // Do NOT let users pick a mode before they have uploaded.
-    // Otherwise we accidentally create empty threads like "New chat".
-    if (!sessionId && uploaded.length === 0) {
-      // Sprint 1: sidebar items are non-functional until upload exists
-      return;
-    }
-
-    // Keep user on the single chat surface.
+    setSidebarActive(key);
+    if (!effectiveSessionId && uploaded.length === 0) return; // need content first
     if (view !== "chat") setView("chat");
-
-    // Sprint 1: do not visually activate sidebar items
-    // setSidebarActive(key);
-
-    if (key === "flash_cards") {
-      void onSelectOutput("flash_card");
-      return;
-    }
-
-    if (key === "podcast") {
-      void onSelectOutput("podcast");
-      return;
-    }
-
-    if (key === "study_guide") {
-      void onSelectOutput("study_guide");
-      return;
-    }
-
-    // mock_test not implemented yet
-    if (key === "mock_test") {
-      // Sprint 1: no-op
-      return;
-    }
+    if (key === "flash_cards") { void onSelectOutput("flash_card"); return; }
+    if (key === "podcast")     { void onSelectOutput("podcast");    return; }
+    if (key === "mock_test")   { void onSelectOutput("flash_card"); return; } // uses quiz via chat
+    if (key === "study_guide") { void onSelectOutput("study_guide"); return; }
   };
 
   // Background mount
@@ -226,6 +213,21 @@ export default function DashboardPage() {
 
   const effectiveSessionId = sessionId || activeSession?.backendSessionId || null;
   const canChatInCurrentThread = !!effectiveSessionId;
+
+  /** Store session context in sessionStorage then navigate to a feature page. */
+  const navigateToFeature = (route: string) => {
+    try {
+      const sid = effectiveSessionId || sessionId;
+      if (sid) sessionStorage.setItem("pu_session_id", sid);
+      if (uploaded.length > 0) {
+        sessionStorage.setItem(
+          "pu_session_files",
+          JSON.stringify(uploaded.map((f) => ({ name: f.name })))
+        );
+      }
+    } catch { /* sessionStorage not available */ }
+    router.push(route);
+  };
 
   const extractErrorText = (raw: string) => {
     const text = (raw || "").trim();
@@ -587,7 +589,6 @@ export default function DashboardPage() {
     });
   };
 
-  const canContinue = files.length > 0 && !uploading;
   const composerPlaceholder = sourceExpired
     ? "Source expired — re-upload files to continue..."
     : canChatInCurrentThread
@@ -1974,28 +1975,71 @@ const uploadToBackend = async () => {
       }
 
       const data = await res.json();
-      const answer =
-        typeof data.text === "string"
-          ? data.text
-          : Array.isArray(data.cards)
-          ? data.cards
-              .map((c: any, i: number) => {
-                const front = typeof c?.front === "string" ? c.front : "";
-                const back = typeof c?.back === "string" ? c.back : "";
-                return `${i + 1}. ${front}\n   - ${back}`;
-              })
-              .join("\n\n")
-          : typeof data.response === "string"
-          ? data.response
-          : JSON.stringify(data);
+
+      // Build the AI message with structured data for rich rendering
+      let richFields: Partial<ChatMessage> = { loading: false };
+
+      if (k === "podcast" && Array.isArray(data.script)) {
+        richFields = {
+          ...richFields,
+          outputType: "podcast",
+          podcastSpeakers: Array.isArray(data.speakers) ? [data.speakers[0] ?? "Host", data.speakers[1] ?? "Guest"] : ["Host", "Guest"],
+          podcastScript: data.script as PodcastTurn[],
+          text: "", // text unused — rendered from script
+          audioLoading: true,
+        };
+      } else if (k === "flash_card" && Array.isArray(data.cards)) {
+        richFields = {
+          ...richFields,
+          outputType: "flash_card",
+          flashCards: data.cards as Array<{ front: string; back: string }>,
+          text: "",
+        };
+      } else if (typeof data.text === "string") {
+        richFields = { ...richFields, text: data.text };
+      } else if (typeof data.response === "string") {
+        richFields = { ...richFields, text: data.response };
+      } else {
+        richFields = { ...richFields, text: "Done." };
+      }
 
       const nextMessages = messages
         .concat([userMsg, aiLoading])
-        .map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+        .map((m) => (m.id === aiLoadingId ? { ...m, ...richFields } : m));
 
       setMessages(nextMessages);
       upsertActiveSession({ messages: nextMessages });
       void persistThreadSnapshot({ forceMessages: nextMessages });
+
+      // Auto-fetch podcast audio in background after script arrives
+      if (k === "podcast" && Array.isArray(data.script)) {
+        const script = data.script as PodcastTurn[];
+        const speakers: [string, string] = [data.speakers?.[0] ?? "Host", data.speakers?.[1] ?? "Guest"];
+        void (async () => {
+          try {
+            const audioRes = await fetch(`${BACKEND_BASE}/api/podcast/audio`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...authHeaders() },
+              credentials: "include",
+              body: JSON.stringify({ speakers, script }),
+            });
+            if (!audioRes.ok) throw new Error("Audio generation failed");
+            const blob = await audioRes.blob();
+            const url = URL.createObjectURL(blob);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiLoadingId ? { ...m, audioUrl: url, audioLoading: false } : m
+              )
+            );
+          } catch {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiLoadingId ? { ...m, audioLoading: false } : m
+              )
+            );
+          }
+        })();
+      }
     } catch (e: any) {
       const nextMessages = messages
         .concat([userMsg, aiLoading])
@@ -3512,8 +3556,23 @@ const uploadToBackend = async () => {
                     <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "right" : "left"}`}>
                       <div className={`pu-msgBubble ${m.role === "user" ? "user" : "ai"}`}>
                         {m.title ? <div className="pu-msgTitle">{m.title}</div> : null}
-                        {m.meta ? <div className="pu-msgMeta">{m.meta}</div> : null}
-                        <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
+                        {m.meta  ? <div className="pu-msgMeta">{m.meta}</div>  : null}
+
+                        {/* ── Podcast rich card ── */}
+                        {m.outputType === "podcast" && !m.loading ? (
+                          <PodcastCard
+                            speakers={m.podcastSpeakers ?? ["Host", "Guest"]}
+                            script={m.podcastScript ?? []}
+                            audioUrl={m.audioUrl ?? null}
+                            audioLoading={m.audioLoading ?? false}
+                          />
+                        ) : m.outputType === "flash_card" && !m.loading && Array.isArray(m.flashCards) ? (
+                          /* ── Flashcard rich card ── */
+                          <FlashCardDeck cards={m.flashCards} />
+                        ) : (
+                          /* ── Plain text (study guide, narrative, chat) ── */
+                          <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -3534,7 +3593,7 @@ const uploadToBackend = async () => {
                           Narrative
                         </button>
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("flash_card")} disabled={generating}>
-                          Flash Card
+                          Flash Cards
                         </button>
                       </div>
                     </div>
@@ -3593,6 +3652,223 @@ const uploadToBackend = async () => {
           </div>
         </main>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Podcast inline audio card
+// ─────────────────────────────────────────────
+function PodcastCard({
+  speakers,
+  script,
+  audioUrl,
+  audioLoading,
+}: {
+  speakers: [string, string];
+  script: PodcastTurn[];
+  audioUrl: string | null;
+  audioLoading: boolean;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [showScript, setShowScript] = useState(false);
+
+  const togglePlay = () => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (playing) { a.pause(); setPlaying(false); }
+    else { void a.play(); setPlaying(true); }
+  };
+
+  const fmt = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, "0")}`;
+  };
+
+  return (
+    <div className="pc-root">
+      {/* header */}
+      <div className="pc-header">
+        <div className="pc-icon">🎙</div>
+        <div>
+          <div className="pc-title">Podcast</div>
+          <div className="pc-sub">{speakers[0]} &amp; {speakers[1]} · {script.length} turns</div>
+        </div>
+      </div>
+
+      {/* audio player */}
+      {audioUrl ? (
+        <>
+          <audio
+            ref={audioRef}
+            src={audioUrl}
+            onTimeUpdate={(e) => setProgress((e.currentTarget.currentTime / (e.currentTarget.duration || 1)) * 100)}
+            onDurationChange={(e) => setDuration(e.currentTarget.duration)}
+            onEnded={() => setPlaying(false)}
+          />
+          <div className="pc-playerBar">
+            <button className="pc-playBtn" onClick={togglePlay} type="button">
+              {playing ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+              )}
+            </button>
+            <div className="pc-progressWrap">
+              <div className="pc-waveform">
+                {Array.from({ length: 32 }).map((_, i) => {
+                  const pct = progress / 100;
+                  const pos = i / 32;
+                  const h = 20 + Math.abs(Math.sin((i * 0.7) + 1.3) * Math.cos(i * 0.4) * 22);
+                  return (
+                    <div
+                      key={i}
+                      className="pc-bar"
+                      style={{
+                        height: `${h}px`,
+                        background: pos <= pct
+                          ? "linear-gradient(180deg,#5aa8ff,#5fe3ff)"
+                          : "rgba(255,255,255,0.15)",
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <input
+                type="range" min={0} max={100} step={0.1}
+                value={progress}
+                className="pc-seek"
+                onChange={(e) => {
+                  const a = audioRef.current;
+                  if (!a) return;
+                  const v = parseFloat(e.target.value);
+                  a.currentTime = (v / 100) * a.duration;
+                  setProgress(v);
+                }}
+              />
+            </div>
+            <div className="pc-time">{fmt((progress / 100) * duration)} / {fmt(duration)}</div>
+            <a href={audioUrl} download="podcast.mp3" className="pc-dl" title="Download MP3">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4"/><path d="M8 12l4 4 4-4"/><path d="M4 20h16"/></svg>
+            </a>
+          </div>
+        </>
+      ) : (
+        <div className="pc-audioLoading">
+          {audioLoading ? (
+            <><div className="pc-audioSpinner" /><span>Generating audio…</span></>
+          ) : (
+            <span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>Audio unavailable</span>
+          )}
+        </div>
+      )}
+
+      {/* transcript toggle */}
+      <button className="pc-scriptToggle" type="button" onClick={() => setShowScript((v) => !v)}>
+        {showScript ? "Hide transcript ↑" : "Show transcript ↓"}
+      </button>
+      {showScript && (
+        <div className="pc-script">
+          {script.map((turn, i) => (
+            <div key={i} className={`pc-turn ${turn.speaker === speakers[0] ? "host" : "guest"}`}>
+              <span className="pc-speaker">{turn.speaker}</span>
+              <span className="pc-turnText">{turn.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <style jsx>{`
+        .pc-root { display:flex; flex-direction:column; gap:10px; min-width:280px; max-width:520px; }
+        .pc-header { display:flex; align-items:center; gap:10px; }
+        .pc-icon { font-size:22px; line-height:1; }
+        .pc-title { font-size:14px; font-weight:950; color:rgba(255,255,255,0.94); letter-spacing:-0.01em; }
+        .pc-sub { font-size:11px; color:rgba(255,255,255,0.5); margin-top:2px; }
+        .pc-playerBar { display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,255,255,0.1); background:rgba(10,12,18,0.4); }
+        .pc-playBtn { width:32px; height:32px; border-radius:50%; border:1px solid rgba(255,255,255,0.15); background:linear-gradient(135deg,rgba(90,168,255,0.85),rgba(95,227,255,0.85)); color:rgba(0,0,0,0.85); display:grid; place-items:center; cursor:pointer; flex-shrink:0; transition:transform 120ms; }
+        .pc-playBtn:hover { transform:scale(1.06); }
+        .pc-progressWrap { flex:1; position:relative; height:36px; display:flex; align-items:center; }
+        .pc-waveform { position:absolute; inset:0; display:flex; align-items:center; gap:2px; pointer-events:none; overflow:hidden; }
+        .pc-bar { flex:1; border-radius:2px; min-height:3px; transition:background 200ms; }
+        .pc-seek { position:absolute; inset:0; width:100%; opacity:0; cursor:pointer; height:100%; }
+        .pc-time { font-size:11px; font-weight:700; color:rgba(255,255,255,0.55); white-space:nowrap; flex-shrink:0; }
+        .pc-dl { color:rgba(255,255,255,0.5); display:grid; place-items:center; flex-shrink:0; transition:color 140ms; }
+        .pc-dl:hover { color:rgba(95,227,255,0.9); }
+        .pc-audioLoading { display:flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,255,255,0.08); background:rgba(10,12,18,0.3); font-size:12px; color:rgba(255,255,255,0.6); }
+        .pc-audioSpinner { width:14px; height:14px; border-radius:50%; border:2px solid rgba(255,255,255,0.15); border-top-color:#5aa8ff; animation:spin 0.8s linear infinite; flex-shrink:0; }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .pc-scriptToggle { align-self:flex-start; font-size:11px; font-weight:700; color:rgba(95,227,255,0.7); background:none; border:none; cursor:pointer; padding:0; letter-spacing:0.02em; }
+        .pc-scriptToggle:hover { color:rgba(95,227,255,1); }
+        .pc-script { display:flex; flex-direction:column; gap:8px; max-height:280px; overflow-y:auto; padding:4px 0; }
+        .pc-turn { display:flex; gap:8px; font-size:13px; line-height:1.5; }
+        .pc-speaker { font-weight:900; min-width:46px; flex-shrink:0; }
+        .pc-turn.host .pc-speaker { color:#5aa8ff; }
+        .pc-turn.guest .pc-speaker { color:#5fe3ff; }
+        .pc-turnText { color:rgba(255,255,255,0.82); }
+      `}</style>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Flashcard inline deck
+// ─────────────────────────────────────────────
+function FlashCardDeck({ cards }: { cards: Array<{ front: string; back: string }> }) {
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+
+  const go = (delta: number) => {
+    setFlipped(false);
+    setTimeout(() => setIdx((i) => Math.max(0, Math.min(cards.length - 1, i + delta))), 120);
+  };
+
+  const card = cards[idx];
+  if (!card) return null;
+
+  return (
+    <div className="fc-root">
+      <div className="fc-counter">{idx + 1} / {cards.length}</div>
+      <div className={`fc-card ${flipped ? "flipped" : ""}`} onClick={() => setFlipped((v) => !v)}>
+        <div className="fc-inner">
+          <div className="fc-face fc-front"><span>{card.front}</span></div>
+          <div className="fc-face fc-back"><span>{card.back}</span></div>
+        </div>
+        <div className="fc-hint">{flipped ? "Click to flip back" : "Click to reveal answer"}</div>
+      </div>
+      <div className="fc-nav">
+        <button className="fc-navBtn" disabled={idx === 0} onClick={() => go(-1)} type="button">←</button>
+        <div className="fc-dots">
+          {cards.slice(Math.max(0, idx - 2), idx + 3).map((_, i) => {
+            const real = Math.max(0, idx - 2) + i;
+            return <div key={real} className={`fc-dot ${real === idx ? "active" : ""}`} />;
+          })}
+        </div>
+        <button className="fc-navBtn" disabled={idx === cards.length - 1} onClick={() => go(1)} type="button">→</button>
+      </div>
+
+      <style jsx>{`
+        .fc-root { display:flex; flex-direction:column; gap:10px; min-width:260px; max-width:460px; }
+        .fc-counter { font-size:10px; font-weight:900; letter-spacing:0.1em; text-transform:uppercase; color:rgba(255,255,255,0.45); }
+        .fc-card { cursor:pointer; perspective:900px; height:140px; }
+        .fc-inner { position:relative; width:100%; height:100%; transform-style:preserve-3d; transition:transform 380ms cubic-bezier(.4,0,.2,1); }
+        .fc-card.flipped .fc-inner { transform:rotateY(180deg); }
+        .fc-face { position:absolute; inset:0; border-radius:16px; border:1px solid rgba(255,255,255,0.12); display:flex; align-items:center; justify-content:center; padding:18px; text-align:center; backface-visibility:hidden; -webkit-backface-visibility:hidden; }
+        .fc-front { background:rgba(10,12,18,0.45); }
+        .fc-back { background:rgba(16,22,40,0.55); border-color:rgba(90,168,255,0.22); transform:rotateY(180deg); }
+        .fc-face span { font-size:14px; font-weight:700; color:rgba(255,255,255,0.9); line-height:1.5; }
+        .fc-hint { font-size:10px; color:rgba(255,255,255,0.3); text-align:center; margin-top:4px; }
+        .fc-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+        .fc-navBtn { width:34px; height:34px; border-radius:50%; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.85); font-size:14px; cursor:pointer; display:grid; place-items:center; transition:background 140ms; }
+        .fc-navBtn:hover:not(:disabled) { background:rgba(255,255,255,0.08); border-color:rgba(95,227,255,0.25); }
+        .fc-navBtn:disabled { opacity:0.28; cursor:default; }
+        .fc-dots { display:flex; gap:5px; align-items:center; }
+        .fc-dot { width:5px; height:5px; border-radius:50%; background:rgba(255,255,255,0.2); transition:background 200ms; }
+        .fc-dot.active { background:rgba(95,227,255,0.8); width:8px; border-radius:4px; }
+      `}</style>
     </div>
   );
 }

@@ -180,7 +180,7 @@ async def discord_callback(
     error: Optional[str] = None,
 ):
     if error:
-        return RedirectResponse(f"{_frontend_base()}/dashboard?discord=error", status_code=302)
+        return RedirectResponse(f"{_frontend_base()}/discord?discord=error", status_code=302)
 
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code/state from Discord callback")
@@ -202,7 +202,7 @@ async def discord_callback(
     resp = await _post_form_with_retries(DISCORD_TOKEN_URL, data=data, headers=headers, max_retries=6)
     if resp.status_code >= 400:
         # Avoid showing raw JSON in the browser; send user back with an error flag
-        return RedirectResponse(f"{_frontend_base()}/dashboard?discord=error", status_code=302)
+        return RedirectResponse(f"{_frontend_base()}/discord?discord=error", status_code=302)
     token = resp.json()
 
     sess["discord"] = {
@@ -214,7 +214,7 @@ async def discord_callback(
     }
     sess.pop("discord_oauth_state", None)
 
-    return RedirectResponse(f"{_frontend_base()}/dashboard?discord=connected", status_code=302)
+    return RedirectResponse(f"{_frontend_base()}/discord?discord=connected", status_code=302)
 
 
 @router.get("/discord/status")

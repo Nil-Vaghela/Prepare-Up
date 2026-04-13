@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import time
-from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from openai import OpenAI
+
+# Import DB-based session reader from chat module (upload.py stores sessions there)
+from app.api.chat import _read_session_text
 
 router = APIRouter()
 
@@ -19,51 +20,23 @@ def _get_client() -> OpenAI:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set in the backend environment.")
     return OpenAI(api_key=api_key)
 
-TMP_DIR = Path("/tmp/prepareup_sessions")
-SESSION_TTL_SECONDS = 60 * 30
-
-def _read_session_text(session_id: str) -> str:
-    p = TMP_DIR / f"{session_id}.txt"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Session not found or expired.")
-
-    raw = p.read_text(encoding="utf-8")
-    first_nl = raw.find("\n")
-    if first_nl == -1:
-        raise HTTPException(status_code=500, detail="Corrupt session store.")
-
-    created_ts = int(raw[:first_nl])
-    if (int(time.time()) - created_ts) > SESSION_TTL_SECONDS:
-        try:
-            p.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise HTTPException(status_code=404, detail="Session expired.")
-
-    return raw[first_nl + 1 :]
-
 
 class GenerateRequest(BaseModel):
     session_id: str
-    # Match the frontend OutputType keys exactly
     output_type: Literal["flash_card", "study_guide", "podcast", "narrative"]
-    # Only used for flashcards; ignored otherwise
     count: Optional[int] = Field(default=20, ge=5, le=50)
 
 
 @router.post("/generate")
 def generate(req: GenerateRequest):
+    # Use DB-backed session text (matches what upload.py stores)
     corpus = _read_session_text(req.session_id).strip()
     if not corpus:
         raise HTTPException(status_code=400, detail="No extracted text available for this session.")
 
-    # Keep it sane — you can do smarter chunking later
     corpus = corpus[:60_000]
-
-    # Default count for flashcards
     count = int(req.count or 20)
 
-    # Build prompt + schema per output type
     if req.output_type == "flash_card":
         schema = {
             "name": "flashcards_schema",
@@ -101,7 +74,6 @@ def generate(req: GenerateRequest):
         user_instruction = f"CONTENT:\n{corpus}\n\nMake exactly {count} flashcards."
 
     elif req.output_type == "podcast":
-        # Podcast output: return a 2-person dialogue script for TTS
         schema = {
             "name": "podcast_schema",
             "schema": {
@@ -135,7 +107,7 @@ def generate(req: GenerateRequest):
 
         prompt = (
             "You are a study assistant. Create a podcast-style dialogue STRICTLY from the provided content. "
-            "No outside facts. Use exactly two speakers (e.g., Host and Guest). "
+            "No outside facts. Use exactly two speakers (Host and Guest). "
             "Make it engaging and natural for text-to-speech: short turns, clear phrasing, and occasional recaps. "
             "Include a brief intro and outro."
         )
@@ -146,7 +118,6 @@ def generate(req: GenerateRequest):
         )
 
     else:
-        # Text-based outputs: return a structured object {type, text}
         schema = {
             "name": "text_output_schema",
             "schema": {
@@ -166,16 +137,14 @@ def generate(req: GenerateRequest):
                 "Use headings and bullet points. Include key definitions, formulas (if any), and a short summary at the end."
             )
             user_instruction = f"CONTENT:\n{corpus}\n\nReturn a study guide as plain text in the 'text' field."
-
-        else:  # narrative
+        else:
             prompt = (
                 "You are a study assistant. Rewrite the provided content into an easy-to-read narrative explanation. "
                 "Use simple language, but do not add outside facts."
             )
             user_instruction = f"CONTENT:\n{corpus}\n\nReturn the narrative as plain text in the 'text' field."
 
-    # Use Chat Completions (compatible across OpenAI SDK versions)
-    model_name = os.getenv("OPENAI_MODEL", "gpt-5-nano")
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     resp = _get_client().chat.completions.create(
         model=model_name,
@@ -199,10 +168,8 @@ def generate(req: GenerateRequest):
     except Exception:
         raise HTTPException(status_code=502, detail=f"Model returned invalid JSON: {content[:200]}")
 
-    # Ensure the 'type' matches the requested output type
     payload_type = payload.get("type")
     if req.output_type in ("study_guide", "narrative") and payload_type != req.output_type:
-        # Force-correct for text outputs to keep UI consistent
         payload["type"] = req.output_type
 
     return payload
