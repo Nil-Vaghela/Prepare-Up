@@ -68,7 +68,7 @@ async def generate_podcast_audio(req: PodcastAudioRequest):
     # Synthesize each turn and collect audio chunks
     audio_parts: list[bytes] = []
     for turn in req.script:
-        text = turn.text.strip()
+        text = turn.text.strip()[:4096]  # OpenAI TTS max input length
         if not text:
             continue
         voice = speaker_voice.get(turn.speaker, "alloy")

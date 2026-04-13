@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 
 # Import DB-based session reader from chat module (upload.py stores sessions there)
-from app.api.chat import _read_session_text
+from app.api.chat import _read_session_text, _verify_session_owner
 
 router = APIRouter()
 
@@ -28,7 +28,10 @@ class GenerateRequest(BaseModel):
 
 
 @router.post("/generate")
-def generate(req: GenerateRequest):
+def generate(req: GenerateRequest, request: Request):
+    # Verify the requester owns this session before generating content
+    _verify_session_owner(req.session_id, request)
+
     # Use DB-backed session text (matches what upload.py stores)
     corpus = _read_session_text(req.session_id).strip()
     if not corpus:

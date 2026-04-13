@@ -180,7 +180,7 @@ async def discord_callback(
     error: Optional[str] = None,
 ):
     if error:
-        return RedirectResponse(f"{_frontend_base()}/discord?discord=error", status_code=302)
+        return RedirectResponse(f"{_frontend_base()}/dashboard?discord=error", status_code=302)
 
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code/state from Discord callback")
@@ -202,7 +202,7 @@ async def discord_callback(
     resp = await _post_form_with_retries(DISCORD_TOKEN_URL, data=data, headers=headers, max_retries=6)
     if resp.status_code >= 400:
         # Avoid showing raw JSON in the browser; send user back with an error flag
-        return RedirectResponse(f"{_frontend_base()}/discord?discord=error", status_code=302)
+        return RedirectResponse(f"{_frontend_base()}/dashboard?discord=error", status_code=302)
     token = resp.json()
 
     sess["discord"] = {
@@ -214,7 +214,7 @@ async def discord_callback(
     }
     sess.pop("discord_oauth_state", None)
 
-    return RedirectResponse(f"{_frontend_base()}/discord?discord=connected", status_code=302)
+    return RedirectResponse(f"{_frontend_base()}/dashboard?discord=connected", status_code=302)
 
 
 @router.get("/discord/status")
@@ -259,10 +259,45 @@ async def discord_guilds(request: Request):
 
     guilds = await _discord_api_get(access, "/users/@me/guilds")
 
+    # Fetch bot's guild list in a SINGLE call instead of one call per user-guild (N+1 fix).
+    bot_guild_ids: set[str] = set()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            bot_resp = await client.get(
+                f"{DISCORD_API_V10}/users/@me/guilds",
+                headers=_bot_headers(),
+                params={"limit": 200},
+            )
+        if bot_resp.status_code == 200:
+            bot_guild_ids = {str(g["id"]) for g in (bot_resp.json() or [])}
+    except Exception:
+        pass  # If bot guild fetch fails, just show all as "not installed"
+
     simplified = []
-    for g in (guilds or [])[:25]:  # limit to first 25 servers to avoid rate limits
-        result = await _guild_with_bot_status(g)
-        simplified.append(result)
+    for g in (guilds or []):
+        guild_id = str(g.get("id") or "")
+        perms = g.get("permissions")
+        is_owner = bool(g.get("owner"))
+        can_manage = _can_manage_guild(perms) or is_owner
+        installed = guild_id in bot_guild_ids
+
+        if installed:
+            setup_status = "connected"
+        elif can_manage:
+            setup_status = "can_install"
+        else:
+            setup_status = "needs_admin"
+
+        simplified.append({
+            "id": guild_id,
+            "name": g.get("name"),
+            "owner": is_owner,
+            "permissions": perms,
+            "can_manage": can_manage,
+            "installed": installed,
+            "setup_status": setup_status,
+        })
+
     simplified.sort(
         key=lambda g: (
             0 if g.get("installed") else 1,
@@ -341,10 +376,18 @@ async def discord_bot_list_channels(guild_id: str):
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
     chans = resp.json() or []
-    # Keep text + announcement channels
+    # Keep text (0) + announcement (5) channels only
     filtered = [c for c in chans if c.get("type") in (0, 5)]
+    # Sort by position so order matches Discord's sidebar
+    filtered.sort(key=lambda c: (c.get("position") or 0))
     simplified = [
-        {"id": c.get("id"), "name": c.get("name"), "type": c.get("type"), "parent_id": c.get("parent_id")}
+        {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "type": c.get("type"),
+            "parent_id": c.get("parent_id"),
+            "position": c.get("position", 0),
+        }
         for c in filtered
     ]
     return JSONResponse({"channels": simplified})
@@ -385,6 +428,7 @@ async def discord_bot_import_channel(
     collected: list[Dict[str, Any]] = []
     before: Optional[str] = None
 
+    rate_limit_hits = 0
     async with httpx.AsyncClient(timeout=30) as client:
         while len(collected) < max_messages:
             params: Dict[str, Any] = {"limit": 100}
@@ -398,16 +442,20 @@ async def discord_bot_import_channel(
             )
 
             if resp.status_code == 429:
+                rate_limit_hits += 1
+                if rate_limit_hits > 5:
+                    # Too many rate-limits — return what we have so far
+                    break
                 retry_after = resp.headers.get("Retry-After")
                 try:
-                    wait_s = float(retry_after) if retry_after else 1.0
+                    wait_s = float(retry_after) if retry_after else (2.0 ** rate_limit_hits)
                 except ValueError:
-                    wait_s = 1.0
-                await asyncio.sleep(min(wait_s, 15.0))
+                    wait_s = 2.0 ** rate_limit_hits
+                await asyncio.sleep(min(wait_s, 30.0))
                 continue
 
             if resp.status_code >= 400:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+                raise HTTPException(status_code=resp.status_code, detail=f"Discord API error {resp.status_code}")
 
             batch = resp.json() or []
             if not batch:

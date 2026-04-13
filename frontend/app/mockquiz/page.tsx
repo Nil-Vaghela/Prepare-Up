@@ -20,7 +20,7 @@ const FEATURES = [
 
 export default function MockQuizPage() {
   const router = useRouter();
-  const { accessToken } = useAuth();
+  const { accessToken, loading: authLoading } = useAuth();
   const [threads, setThreads] = useState<Thread[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Thread | null>(null);
@@ -36,6 +36,7 @@ export default function MockQuizPage() {
   const [score, setScore] = useState(0);
 
   useEffect(() => {
+    if (authLoading) return;
     fetch(`${BACKEND}/api/chat/threads`, {
       credentials: "include",
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
@@ -43,7 +44,7 @@ export default function MockQuizPage() {
       .then(r => r.ok ? r.json() : { threads: [] })
       .then(d => setThreads(d.threads || []))
       .catch(() => {});
-  }, [accessToken]);
+  }, [accessToken, authLoading]);
 
   const filtered = threads.filter(t =>
     (t.title || "Untitled").toLowerCase().includes(query.toLowerCase())
@@ -79,7 +80,7 @@ export default function MockQuizPage() {
       setError(e instanceof Error ? e.message : "Generation failed.");
       setView("select");
     }
-  }, [count]);
+  }, [count, accessToken]);
 
   const onChoose = (i: number) => {
     if (chosenIdx !== null) return;

@@ -9,11 +9,11 @@ import json
 import os
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
-from app.api.chat import _read_session_text
+from app.api.chat import _read_session_text, _verify_session_owner
 
 router = APIRouter()
 
@@ -31,7 +31,8 @@ class QuizRequest(BaseModel):
 
 
 @router.post("/quiz/generate")
-def generate_quiz(req: QuizRequest):
+def generate_quiz(req: QuizRequest, request: Request):
+    _verify_session_owner(req.session_id, request)
     corpus = _read_session_text(req.session_id).strip()
     if not corpus:
         raise HTTPException(status_code=400, detail="No extracted text available for this session.")

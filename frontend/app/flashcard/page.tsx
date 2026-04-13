@@ -20,7 +20,7 @@ const FEATURES = [
 
 export default function FlashcardPage() {
   const router = useRouter();
-  const { accessToken } = useAuth();
+  const { accessToken, loading: authLoading } = useAuth();
   const [threads, setThreads] = useState<Thread[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Thread | null>(null);
@@ -33,6 +33,7 @@ export default function FlashcardPage() {
   const [shuffled, setShuffled] = useState<Card[]>([]);
 
   useEffect(() => {
+    if (authLoading) return; // wait for auth-context to finish restoring session
     fetch(`${BACKEND}/api/chat/threads`, {
       credentials: "include",
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
@@ -40,7 +41,7 @@ export default function FlashcardPage() {
       .then(r => r.ok ? r.json() : { threads: [] })
       .then(d => setThreads(d.threads || []))
       .catch(() => {});
-  }, [accessToken]);
+  }, [accessToken, authLoading]);
 
   const filtered = threads.filter(t => (t.title || "Untitled").toLowerCase().includes(query.toLowerCase()));
   const displayCards = shuffled.length ? shuffled : cards;
@@ -75,7 +76,7 @@ export default function FlashcardPage() {
       setError(e instanceof Error ? e.message : "Generation failed.");
       setView("select");
     }
-  }, [cardCount]);
+  }, [cardCount, accessToken]);
 
   const shuffle = () => {
     const copy = [...cards].sort(() => Math.random() - 0.5);

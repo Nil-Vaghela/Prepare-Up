@@ -3,11 +3,7 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-declare global {
-  interface Window {
-    google?: any;
-  }
-}
+// window.google type is declared in lib/auth-context.tsx
 import * as THREE from "three";
 
 type Theme = {
@@ -519,7 +515,8 @@ function Topbar() {
 
     try {
       // Re-init each click is okay for now; later we can init once.
-      window.google.accounts.id.initialize({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (window.google!.accounts!.id!.initialize as any)({
         client_id: GOOGLE_CLIENT_ID,
         // Safari/non-Chrome can fail with FedCM prompts; force legacy behavior.
         // This is safe and avoids Safari weirdness.
@@ -527,7 +524,7 @@ function Topbar() {
         ux_mode: "popup",
         cancel_on_tap_outside: false,
         auto_select: false,
-        callback: async (response: any) => {
+        callback: async (response: { credential?: string }) => {
           try {
             const res = await fetch(`${API_BASE}/api/auth/google`, {
               method: "POST",
@@ -564,7 +561,7 @@ function Topbar() {
       });
 
       // Show the One Tap / prompt
-      window.google.accounts.id.prompt();
+      window.google?.accounts?.id?.prompt?.();
     } catch (e: any) {
       console.error("Google login init/prompt error:", e);
       setError(e?.message || "Login failed. Please try again.");

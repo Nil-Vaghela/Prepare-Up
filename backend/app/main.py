@@ -11,7 +11,7 @@ load_dotenv()
 from app.core.config import settings
 from app.api.health import router as health_router
 from app.api.hello import router as hello_router
-from app.api.dahsboard import router as dashboard_router
+from app.api.dashboard import router as dashboard_router
 from app.api.upload import router as upload_router
 from app.api.generate import router as generate_router
 from app.api.chat import router as chat_router
@@ -50,12 +50,17 @@ COOKIE_DOMAIN = (os.getenv("COOKIE_DOMAIN") or "").strip() or None
 ANON_COOKIE_MAX_AGE = 60 * 60 * 24 * 30
 
 # CORS: allow credentials so cookies work across localhost:3000 → localhost:8000
+# CORS_ORIGINS env var is a comma-separated list; defaults to localhost:3000 for dev.
+_raw_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+CORS_ORIGINS_LIST: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# Always include localhost variants so local dev never breaks
+for _extra in ("http://localhost:3000", "http://127.0.0.1:3000"):
+    if _extra not in CORS_ORIGINS_LIST:
+        CORS_ORIGINS_LIST.append(_extra)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=CORS_ORIGINS_LIST,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

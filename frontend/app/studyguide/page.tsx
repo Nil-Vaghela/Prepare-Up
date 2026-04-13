@@ -45,7 +45,7 @@ function parseGuide(text: string): Section[] {
 
 export default function StudyGuidePage() {
   const router = useRouter();
-  const { accessToken } = useAuth();
+  const { accessToken, loading: authLoading } = useAuth();
   const [threads, setThreads] = useState<Thread[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Thread | null>(null);
@@ -56,6 +56,7 @@ export default function StudyGuidePage() {
   const [activeSection, setActiveSection] = useState(0);
 
   useEffect(() => {
+    if (authLoading) return;
     fetch(`${BACKEND}/api/chat/threads`, {
       credentials: "include",
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
@@ -63,7 +64,7 @@ export default function StudyGuidePage() {
       .then(r => r.ok ? r.json() : { threads: [] })
       .then(d => setThreads(d.threads || []))
       .catch(() => {});
-  }, [accessToken]);
+  }, [accessToken, authLoading]);
 
   const filtered = threads.filter(t =>
     (t.title || "Untitled").toLowerCase().includes(query.toLowerCase())
@@ -98,7 +99,7 @@ export default function StudyGuidePage() {
       setError(e instanceof Error ? e.message : "Generation failed.");
       setView("select");
     }
-  }, []);
+  }, [accessToken]);
 
   const downloadGuide = () => {
     const blob = new Blob([rawText], { type: "text/plain" });

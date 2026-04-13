@@ -78,20 +78,7 @@ type UserProfile = {
   avatar_url?: string | null;
 };
 
-type GoogleAccounts = {
-  id?: {
-    initialize?: (opts: { client_id: string; callback: (res: { credential?: string }) => void }) => void;
-    renderButton?: (el: HTMLElement, opts: Record<string, unknown>) => void;
-    prompt?: () => void;
-    disableAutoSelect?: () => void;
-  };
-};
-
-declare global {
-  interface Window {
-    google?: { accounts?: GoogleAccounts };
-  }
-}
+// window.google type is declared in lib/auth-context.tsx
 
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
@@ -110,10 +97,56 @@ export default function DashboardPage() {
   const router = useRouter();
 
   // Helper to build Authorization headers if accessToken exists
-  const authHeaders = () => {
+  const authHeaders = (token?: string | null) => {
+    const t = token !== undefined ? token : accessToken;
     const h: Record<string, string> = {};
-    if (accessToken) h.Authorization = `Bearer ${accessToken}`;
+    if (t) h.Authorization = `Bearer ${t}`;
     return h;
+  };
+
+  // Silently refresh the access token from the HttpOnly refresh cookie.
+  // Promise-lock ensures concurrent 401s only trigger ONE refresh, not many.
+  const _refreshLockRef = useRef<Promise<string | null> | null>(null);
+  const silentRefresh = async (): Promise<string | null> => {
+    if (_refreshLockRef.current) return _refreshLockRef.current;
+    const p = (async () => {
+      try {
+        const res = await fetch(`${BACKEND_BASE}/api/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const newToken = typeof data?.access_token === "string" ? data.access_token : null;
+        if (newToken) setAccessToken(newToken);
+        return newToken;
+      } catch {
+        return null;
+      } finally {
+        _refreshLockRef.current = null;
+      }
+    })();
+    _refreshLockRef.current = p;
+    return p;
+  };
+
+  // Authenticated fetch that auto-refreshes on 401.
+  const authFetch = async (url: string, init: RequestInit = {}): Promise<Response> => {
+    const hdrs = new Headers(init.headers as HeadersInit);
+    if (accessToken) hdrs.set("Authorization", `Bearer ${accessToken}`);
+
+    const res = await fetch(url, { ...init, headers: hdrs, credentials: "include" });
+
+    if (res.status === 401) {
+      // Token may be expired — try a silent refresh and retry once
+      const newToken = await silentRefresh();
+      if (newToken) {
+        hdrs.set("Authorization", `Bearer ${newToken}`);
+        return fetch(url, { ...init, headers: hdrs, credentials: "include" });
+      }
+    }
+
+    return res;
   };
   const [sidebarActive, setSidebarActive] = useState<"flash_cards" | "podcast" | "mock_test" | "study_guide" | null>(
     null
@@ -446,10 +479,9 @@ export default function DashboardPage() {
       (opts?.forceTitle ?? (uploaded?.[0]?.name ? uploaded[0].name : "Chat")) || "Chat";
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/chat/sync`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/chat/sync`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           thread_id: threadId,
@@ -850,8 +882,8 @@ export default function DashboardPage() {
 
     idApi.initialize({
       client_id: GOOGLE_CLIENT_ID,
-      callback: (res: { credential: string; }) => {
-        const cred = res?.credential || "";
+      callback: (res: { credential?: string }) => {
+        const cred = res?.credential ?? "";
         void completeLogin(cred);
       },
     });
@@ -913,13 +945,15 @@ export default function DashboardPage() {
 
   // Leak-proof: do not persist chat threads to localStorage
 
-  const loadThreadsFromBackend = async () => {
+  const loadThreadsFromBackend = async (explicitToken?: string | null) => {
+    const effectiveToken = explicitToken !== undefined ? explicitToken : accessToken;
+    const hdrs: Record<string, string> = {};
+    if (effectiveToken) hdrs.Authorization = `Bearer ${effectiveToken}`;
+
     try {
       const res = await fetch(`${BACKEND_BASE}/api/chat/threads`, {
         credentials: "include",
-        headers: {
-          ...authHeaders(),
-        },
+        headers: hdrs,
       });
 
       if (!res.ok) {
@@ -963,9 +997,38 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    // Leak-proof: do not hydrate chat sessions from localStorage.
-    // Chat history must come from the backend database.
-    void loadThreadsFromBackend();
+    // On mount: restore auth session (refresh cookie → access token), then load threads.
+    // This ensures logged-in users see their account threads after a page reload.
+    const initSession = async () => {
+      let restoredToken: string | null = null;
+      try {
+        const refreshRes = await fetch(`${BACKEND_BASE}/api/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (refreshRes.ok) {
+          const refreshData = await refreshRes.json();
+          restoredToken = typeof refreshData?.access_token === "string" ? refreshData.access_token : null;
+          const rawUser = refreshData?.user || refreshData?.profile;
+          if (restoredToken) setAccessToken(restoredToken);
+          if (rawUser) {
+            setUserProfile({
+              id: typeof rawUser.id === "string" ? rawUser.id : null,
+              name: typeof rawUser.display_name === "string"
+                ? rawUser.display_name
+                : typeof rawUser.name === "string" ? rawUser.name : null,
+              email: typeof rawUser.email === "string" ? rawUser.email : null,
+              avatar_url: typeof rawUser.avatar_url === "string" ? rawUser.avatar_url : null,
+            });
+          }
+        }
+      } catch { /* backend not ready or not logged in */ }
+
+      // Pass the restored token directly so the fetch uses it (state may not have propagated yet)
+      await loadThreadsFromBackend(restoredToken);
+    };
+
+    void initSession();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -990,6 +1053,9 @@ export default function DashboardPage() {
       setAccessToken(null);
       setAuthMenuOpen(false);
       setAuthLoading(false);
+      // Clear thread list immediately so logged-in threads don't flash on screen
+      // while the re-fetch (anon-only) is in flight.
+      setChatSessions([]);
       void refreshMe({ allowFail: true });
       void loadThreadsFromBackend();
     }
@@ -1013,8 +1079,11 @@ export default function DashboardPage() {
   const [discordGuildsLoading, setDiscordGuildsLoading] = useState(false);
   const [discordInstallOpen, setDiscordInstallOpen] = useState(false);
   const [discordInstallError, setDiscordInstallError] = useState<string>("");
+  // Per-guild request state: maps guild_id → { message, invite_url, loading }
   const [discordRequestMessage, setDiscordRequestMessage] = useState<string>("");
   const [discordRequestInvite, setDiscordRequestInvite] = useState<string>("");
+  const [discordRequestGuildId, setDiscordRequestGuildId] = useState<string>("");
+  const [discordRequestLoading, setDiscordRequestLoading] = useState<string>(""); // guild_id of loading guild
   const [discordChannels, setDiscordChannels] = useState<DiscordChannel[]>([]);
   const [discordChannelsLoading, setDiscordChannelsLoading] = useState(false);
   const [selectedDiscordGuildId, setSelectedDiscordGuildId] = useState<string>("");
@@ -1043,39 +1112,44 @@ export default function DashboardPage() {
     }
   };
 
-const fetchDiscordChannels = async (guildId: string) => {
-  setDiscordChannelsLoading(true);
-  try {
-    const res = await fetch(`${BACKEND_BASE}/api/discord/bot/guilds/${guildId}/channels`, {
-      credentials: "include",
-      headers: { ...authHeaders() },
-    });
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(msg || "Failed to load Discord channels");
+  const fetchDiscordChannels = async (guildId: string) => {
+    setDiscordChannelsLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/discord/bot/guilds/${guildId}/channels`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Failed to load Discord channels");
+      }
+      const data = await res.json();
+      const chans: DiscordChannel[] = Array.isArray(data?.channels) ? data.channels : [];
+      setDiscordChannels(chans);
+      setSelectedDiscordGuildId(guildId);
+      // Do NOT auto-select a channel — user must pick one explicitly
+      setSelectedDiscordChannelId("");
+    } catch {
+      setDiscordChannels([]);
+      setSelectedDiscordGuildId(guildId);
+      setSelectedDiscordChannelId("");
+    } finally {
+      setDiscordChannelsLoading(false);
     }
-    const data = await res.json();
-    const chans: DiscordChannel[] = Array.isArray(data?.channels) ? data.channels : [];
-    setDiscordChannels(chans);
-    setSelectedDiscordGuildId(guildId);
-    setSelectedDiscordChannelId((prev) => (prev && chans.some((c) => c.id === prev) ? prev : chans[0]?.id || ""));
-  } catch {
-    setDiscordChannels([]);
-    setSelectedDiscordGuildId(guildId);
-    setSelectedDiscordChannelId("");
-  } finally {
-    setDiscordChannelsLoading(false);
-  }
-};
+  };
 
   const openDiscordInstall = async () => {
-    setDiscordInstallOpen(true);
+    // Reset request panel state when refreshing guild list
     setDiscordRequestMessage("");
     setDiscordRequestInvite("");
+    setDiscordRequestGuildId("");
+    setDiscordRequestLoading("");
     await fetchDiscordGuilds();
   };
 
   const prepareDiscordSourceInBackground = async () => {
+    // Populate the guild list so the server picker is ready.
+    // Do NOT auto-select a guild or channel — the user must pick explicitly.
     try {
       const res = await fetch(`${BACKEND_BASE}/api/discord/guilds`, {
         credentials: "include",
@@ -1086,23 +1160,17 @@ const fetchDiscordChannels = async (guildId: string) => {
       const data = await res.json();
       const guilds: DiscordGuild[] = Array.isArray(data?.guilds) ? data.guilds : [];
       setDiscordGuilds(guilds);
-
-      const installedGuilds = guilds.filter((g) => g.installed);
-      if (installedGuilds.length > 0) {
-        await fetchDiscordChannels(installedGuilds[0].id);
-      } else {
-        setDiscordChannels([]);
-        setSelectedDiscordGuildId("");
-        setSelectedDiscordChannelId("");
-      }
+      // Reset any stale selection so Step 2 (server picker) is shown
+      setSelectedDiscordGuildId((prev) => (guilds.some((g) => g.id === prev) ? prev : ""));
+      setSelectedDiscordChannelId("");
+      setDiscordChannels([]);
     } catch {
       // ignore background discovery failures on upload screen
     }
   };
 
   const refreshDiscordInstallState = async () => {
-  await fetchDiscordGuilds();
-  await prepareDiscordSourceInBackground();
+    await fetchDiscordGuilds();
   };
 
   const installBot = async () => {
@@ -1143,8 +1211,18 @@ const fetchDiscordChannels = async (guildId: string) => {
   };
 
   const requestAdminInstall = async (g: DiscordGuild) => {
+    // If already showing this guild's panel, toggle it off
+    if (discordRequestGuildId === g.id && discordRequestMessage) {
+      setDiscordRequestGuildId("");
+      setDiscordRequestMessage("");
+      setDiscordRequestInvite("");
+      return;
+    }
+
     setDiscordRequestMessage("");
     setDiscordRequestInvite("");
+    setDiscordRequestGuildId(g.id);
+    setDiscordRequestLoading(g.id);
     setDiscordInstallError("");
     try {
       const qs = new URLSearchParams({ guild_id: g.id, guild_name: g.name });
@@ -1164,10 +1242,13 @@ const fetchDiscordChannels = async (guildId: string) => {
       try {
         if (data?.message) await navigator.clipboard.writeText(data.message);
       } catch {
-        // ignore
+        // ignore clipboard access
       }
     } catch (e: any) {
-      setDiscordInstallError(e?.message || "Failed to generate admin request message");
+      setDiscordInstallError(e?.message || "Failed to generate request message");
+      setDiscordRequestGuildId("");
+    } finally {
+      setDiscordRequestLoading("");
     }
   };
 
@@ -1190,10 +1271,32 @@ const fetchDiscordChannels = async (guildId: string) => {
   }, [discordGuilds]);
 
   useEffect(() => {
-  if (discordState !== "connected") return;
-  void prepareDiscordSourceInBackground();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (discordState !== "connected") return;
+    void prepareDiscordSourceInBackground();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [discordState]);
+
+  // On mount: check if user already has a Discord session (persists across page reloads)
+  useEffect(() => {
+    const checkDiscordStatus = async () => {
+      try {
+        const res = await fetch(`${BACKEND_BASE}/api/discord/status`, {
+          credentials: "include",
+          headers: { ...authHeaders() },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.connected === true) {
+          setDiscordState("connected");
+          setDiscordError("");
+        }
+      } catch {
+        // ignore — backend may not be ready yet
+      }
+    };
+    void checkDiscordStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Read the redirect result from the URL once (prevents repeated token exchange loops)
   useEffect(() => {
@@ -1721,15 +1824,9 @@ const uploadToBackend = async () => {
     }
 
     if (hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel) {
-      const importRes = await fetch(
+      const importRes = await authFetch(
         `${BACKEND_BASE}/api/discord/bot/channels/${selectedDiscordChannel.id}/import?max_messages=300`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            ...authHeaders(),
-          },
-        }
+        { method: "POST" }
       );
 
       if (!importRes.ok) {
@@ -1756,13 +1853,9 @@ const uploadToBackend = async () => {
       }
     }
 
-    const res = await fetch(`${BACKEND_BASE}/api/upload`, {
+    const res = await authFetch(`${BACKEND_BASE}/api/upload`, {
       method: "POST",
       body: form,
-      credentials: "include",
-      headers: {
-        ...authHeaders(),
-      },
     });
 
     if (!res.ok) {
@@ -1954,10 +2047,9 @@ const uploadToBackend = async () => {
     });
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/generate`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/generate`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           output_type: k,
@@ -2085,10 +2177,9 @@ const uploadToBackend = async () => {
     });
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/chat`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           thread_id: activeChatIdRef.current,
@@ -2706,6 +2797,151 @@ const uploadToBackend = async () => {
           box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 16px rgba(95, 227, 255, 0.18);
         }
 
+        /* ── Discord inline flow ── */
+        .pu-discordStep {
+          padding: 14px 16px 16px;
+          border-top: 1px solid rgba(255,255,255,0.06);
+          max-height: 340px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.15) transparent;
+        }
+        .pu-discordStep::-webkit-scrollbar { width: 4px; }
+        .pu-discordStep::-webkit-scrollbar-track { background: transparent; }
+        .pu-discordStep::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+        .pu-discordStepLabel {
+          font-size: 10px;
+          font-weight: 900;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: rgba(255,255,255,0.4);
+          margin-bottom: 10px;
+        }
+        .pu-discordLoading {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          font-size: 12px;
+          color: rgba(255,255,255,0.6);
+          padding: 4px 0;
+        }
+        .pu-discordSpinner {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          border: 2px solid rgba(255,255,255,0.1);
+          border-top-color: #5aa8ff;
+          animation: spin 0.7s linear infinite;
+          flex-shrink: 0;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .pu-discordEmpty {
+          font-size: 12px;
+          color: rgba(255,255,255,0.5);
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 8px;
+        }
+        .pu-discordGuilds {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .pu-discordGuild:hover { border-color: rgba(255,255,255,0.16); background: rgba(255,255,255,0.04); }
+        .pu-discordGuild {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 10px 14px;
+          border-radius: 14px;
+          border: 1px solid rgba(255,255,255,0.08);
+          background: rgba(255,255,255,0.02);
+          transition: border-color 130ms, background 130ms;
+        }
+        .pu-discordGuild.ready {
+          border-color: rgba(95,227,100,0.18);
+          background: rgba(95,227,100,0.04);
+        }
+        .pu-discordGuildLeft { min-width: 0; flex: 1; }
+        .pu-discordGuildName {
+          font-size: 12px;
+          font-weight: 800;
+          color: rgba(255,255,255,0.9);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .pu-discordGuildStatus {
+          font-size: 11px;
+          color: rgba(255,255,255,0.5);
+          margin-top: 2px;
+        }
+        .pu-discordGuild.ready .pu-discordGuildStatus { color: rgba(95,227,100,0.8); }
+        .pu-discordChannels {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          max-height: 180px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.15) transparent;
+        }
+        .pu-discordChannels::-webkit-scrollbar { width: 4px; }
+        .pu-discordChannels::-webkit-scrollbar-track { background: transparent; }
+        .pu-discordChannels::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+        .pu-discordChan {
+          height: 30px;
+          padding: 0 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: rgba(255,255,255,0.03);
+          color: rgba(255,255,255,0.78);
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: all 130ms;
+          white-space: nowrap;
+        }
+        .pu-discordChan:hover { background: rgba(255,255,255,0.07); border-color: rgba(95,227,255,0.25); }
+        .pu-discordChan.active {
+          background: rgba(95,227,255,0.12);
+          border-color: rgba(95,227,255,0.4);
+          color: #5fe3ff;
+        }
+        .pu-discordGuild.pu-discordGuildActive {
+          border-color: rgba(95,227,255,0.25);
+          background: rgba(95,227,255,0.05);
+        }
+        .pu-btnActive {
+          background: rgba(95,227,100,0.12) !important;
+          border-color: rgba(95,227,100,0.35) !important;
+          color: rgba(95,227,100,0.9) !important;
+        }
+        .pu-discordRequest { margin-top: 0; padding: 10px 14px 12px; background: rgba(95,227,255,0.04); border: 1px solid rgba(95,227,255,0.14); border-top: none; border-radius: 0 0 14px 14px; }
+        .pu-discordRequestPreview {
+          font-size: 11px;
+          color: rgba(255,255,255,0.55);
+          background: rgba(0,0,0,0.25);
+          border: 1px solid rgba(255,255,255,0.07);
+          border-radius: 8px;
+          padding: 8px 10px;
+          margin: 8px 0;
+          white-space: pre-wrap;
+          max-height: 80px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.1) transparent;
+          line-height: 1.5;
+        }
+        .pu-discordRequestLabel {
+          font-size: 11px;
+          color: rgba(255,255,255,0.6);
+          margin-bottom: 8px;
+        }
+        .pu-discordRequestBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+
         .pu-fileList {
           margin-top: 14px;
           display: flex;
@@ -3125,152 +3361,6 @@ const uploadToBackend = async () => {
 
         {/* Main */}
         <main className="pu-glass pu-main">
-          {discordInstallOpen ? (
-            <div
-              role="dialog"
-              aria-modal="true"
-              style={{
-                position: "fixed",
-                inset: 0,
-                zIndex: 50,
-                background: "rgba(0,0,0,0.55)",
-                display: "grid",
-                placeItems: "center",
-                padding: 16,
-              }}
-              onMouseDown={(e) => {
-                if (e.target === e.currentTarget) setDiscordInstallOpen(false);
-              }}
-            >
-              <div
-                className="pu-glass"
-                style={{
-                  width: "min(820px, 100%)",
-                  maxHeight: "min(80vh, 720px)",
-                  overflow: "auto",
-                  padding: 16,
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                  <div style={{ fontWeight: 950, fontSize: 14 }}>Add PrepareUp Bot</div>
-                  <button className="pu-btn" type="button" onClick={() => setDiscordInstallOpen(false)}>
-                    Close
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 8, fontSize: 12, color: "rgba(255,255,255,0.70)", lineHeight: 1.5 }}>
-                  Select a server. If you don’t have permission to install apps, we’ll generate a message you can send to an
-                  admin (auto-copied).
-                </div>
-
-                {discordInstallError ? (
-                  <div style={{ marginTop: 10, fontSize: 12, color: "rgba(255,120,120,0.95)" }}>{discordInstallError}</div>
-                ) : null}
-
-                <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  <button
-                    className={`pu-btn ${discordGuildsLoading ? "pu-btnDisabled" : ""}`}
-                    type="button"
-                    onClick={() => void fetchDiscordGuilds()}
-                    disabled={discordGuildsLoading}
-                  >
-                    {discordGuildsLoading ? "Loading…" : "Refresh servers"}
-                  </button>
-
-                  <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
-                    Open install link
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-                  {sortedDiscordGuilds.map((g) => (
-                    <div
-                      key={g.id}
-                      style={{
-                        border: "1px solid rgba(255,255,255,0.10)",
-                        borderRadius: 16,
-                        padding: 12,
-                        background: "rgba(255,255,255,0.03)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                      }}
-                    >
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontWeight: 950, fontSize: 12, color: "rgba(255,255,255,0.92)" }}>{g.name}</div>
-                        <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.62)" }}>
-                          {g.installed
-                            ? "Bot already installed"
-                            : g.can_manage
-                              ? "You can install apps here"
-                              : "Admin permission required"}
-                        </div>
-                      </div>
-
-                      {g.installed ? (
-                        <button className="pu-btn pu-btnDisabled" type="button" disabled title="Bot is already installed">
-                          Installed
-                        </button>
-                      ) : g.can_manage ? (
-                        <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
-                          Add bot
-                        </button>
-                      ) : (
-                        <button className="pu-btn" type="button" onClick={() => void requestAdminInstall(g)}>
-                          Request admin
-                        </button>
-                      )}
-                    </div>
-                  ))}
-
-                  {!discordGuildsLoading && sortedDiscordGuilds.length === 0 ? (
-                    <div style={{ fontSize: 12, color: "rgba(255,255,255,0.62)", padding: 10 }}>
-                      No servers found. Make sure you authorized the correct Discord account.
-                    </div>
-                  ) : null}
-                </div>
-
-                {discordRequestMessage ? (
-                  <div style={{ marginTop: 16 }}>
-                    <div style={{ fontWeight: 950, fontSize: 12 }}>Message to send to an admin</div>
-                    <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                      <button className="pu-btn" type="button" onClick={() => void copyRequestMessage()}>
-                        Copy message
-                      </button>
-                      {discordRequestInvite ? (
-                        <button
-                          className="pu-btn"
-                          type="button"
-                          onClick={() => window.open(discordRequestInvite, "_blank", "noopener,noreferrer")}
-                        >
-                          Open invite link
-                        </button>
-                      ) : null}
-                    </div>
-                    <textarea
-                      value={discordRequestMessage}
-                      readOnly
-                      style={{
-                        marginTop: 10,
-                        width: "100%",
-                        minHeight: 140,
-                        borderRadius: 14,
-                        border: "1px solid rgba(255,255,255,0.12)",
-                        background: "rgba(10,12,18,0.35)",
-                        color: "rgba(255,255,255,0.90)",
-                        padding: 12,
-                        outline: "none",
-                        resize: "vertical",
-                        fontSize: 12,
-                        lineHeight: 1.45,
-                      }}
-                    />
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
           <div className="pu-topbar">
           <div />
 
@@ -3436,56 +3526,195 @@ const uploadToBackend = async () => {
                     </div>
                   </div>
 
-                  {/* Discord integration */}
+                  {/* ── Discord inline integration ── */}
                   <div className="pu-drop pu-discord">
-                    <div className="pu-dropInner">
-                      <div>
+                    {/* Header row — always visible */}
+                    <div className="pu-dropInner" style={{ alignItems: "flex-start" }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
                         <div className="pu-dropTitle">
                           <span className={`pu-dot ${discordState === "connected" ? "ok" : "idle"}`} />
                           Discord
+                          {discordState === "connected" && selectedDiscordGuild && selectedDiscordChannel && (
+                            <span style={{ fontWeight: 700, fontSize: 11, color: "rgba(95,227,100,0.9)", marginLeft: 8 }}>
+                              {selectedDiscordGuild.name} · #{selectedDiscordChannel.name}
+                            </span>
+                          )}
                         </div>
-
                         <div className="pu-dropSub">
-                          {discordState === "connected"
-                            ? discordChannelsLoading
-                              ? "Discord connected. Scanning installed servers and channels in the background…"
-                              : selectedDiscordGuild && selectedDiscordChannel
-                                ? `Discord connected. Ready from ${selectedDiscordGuild.name} • #${selectedDiscordChannel.name}.`
-                                : "Discord connected. Next: add the bot to a server (if you haven't yet)."
-                            : "Connect Discord to pull your server data in the background."}
+                          {discordState === "idle" || discordState === "error"
+                            ? "Connect Discord to import server messages as study material."
+                            : discordState === "connecting"
+                              ? "Redirecting to Discord…"
+                              : hasDiscordSource
+                                ? "Ready — messages will be imported when you click Continue."
+                                : discordGuildsLoading
+                                  ? "Loading your servers…"
+                                  : selectedDiscordGuildId && !selectedDiscordChannelId
+                                    ? `${selectedDiscordGuild?.name} — pick a channel below.`
+                                    : discordGuilds.length > 0
+                                      ? "Pick a server, then a channel to import from."
+                                      : "Connected — click Load Servers to choose what to import."}
                         </div>
-
-                        {discordState === "error" && discordError ? (
-                          <div className="pu-dropSub" style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}>
-                            ⚠️ {discordError}
-                          </div>
-                        ) : null}
+                        {discordState === "error" && discordError && (
+                          <div className="pu-dropSub" style={{ marginTop: 6, color: "rgba(255,120,120,0.9)" }}>⚠️ {discordError}</div>
+                        )}
+                        {discordInstallError && discordState === "connected" && (
+                          <div className="pu-dropSub" style={{ marginTop: 6, color: "rgba(255,120,120,0.9)" }}>⚠️ {discordInstallError}</div>
+                        )}
                       </div>
 
-                      <div className="pu-btnRow">
-                        <button
-                          className={`pu-btn ${discordState === "connecting" ? "pu-btnDisabled" : ""}`}
-                          onClick={onConnectDiscord}
-                          type="button"
-                          disabled={discordState === "connecting"}
-                          suppressHydrationWarning
-                        >
-                          <LinkIcon />
-                          {discordState === "connected" ? "Reconnect" : discordState === "connecting" ? "Connecting…" : "Connect"}
-                        </button>
-
-                        <button
-                          className={`pu-btn ${discordState === "connected" ? "" : "pu-btnDisabled"}`}
-                          type="button"
-                          onClick={onInviteBot}
-                          disabled={discordState !== "connected"}
-                          title={discordState === "connected" ? "" : "Connect Discord first"}
-                        >
-                          <DownloadIcon />
-                          Add Bot
-                        </button>
+                      <div className="pu-btnRow" style={{ flexShrink: 0 }}>
+                        {discordState !== "connected" ? (
+                          <button
+                            className={`pu-btn ${discordState === "connecting" ? "pu-btnDisabled" : ""}`}
+                            onClick={onConnectDiscord}
+                            type="button"
+                            disabled={discordState === "connecting"}
+                            suppressHydrationWarning
+                          >
+                            <LinkIcon />
+                            {discordState === "connecting" ? "Connecting…" : "Connect"}
+                          </button>
+                        ) : hasDiscordSource ? (
+                          <button className="pu-btn" type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setSelectedDiscordChannelId(""); setDiscordChannels([]); }}>
+                            Change
+                          </button>
+                        ) : selectedDiscordGuildId ? (
+                          // Step 3 active — back to server list
+                          <button className="pu-btn" type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setDiscordChannels([]); }}>
+                            ← Servers
+                          </button>
+                        ) : (
+                          // Disconnected or guilds not loaded — load servers
+                          <button className="pu-btn" type="button"
+                            onClick={() => void fetchDiscordGuilds()}
+                            disabled={discordGuildsLoading}
+                            suppressHydrationWarning>
+                            {discordGuildsLoading ? "Loading…" : discordGuilds.length > 0 ? "Reload" : "Load Servers"}
+                          </button>
+                        )}
                       </div>
                     </div>
+
+                    {/* Step 2: server list */}
+                    {discordState === "connected" && !selectedDiscordGuildId && (
+                      <div className="pu-discordStep">
+                        {discordGuildsLoading ? (
+                          <div className="pu-discordLoading">
+                            <div className="pu-discordSpinner" />
+                            <span>Loading servers…</span>
+                          </div>
+                        ) : sortedDiscordGuilds.length === 0 ? (
+                          <div className="pu-discordEmpty">
+                            No Discord servers found. Make sure you authorized the right account.
+                            <button className="pu-btn" style={{ marginTop: 8 }} onClick={() => void fetchDiscordGuilds()}>Retry</button>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="pu-discordStepLabel">SELECT A SERVER</div>
+                            <div className="pu-discordGuilds">
+                              {sortedDiscordGuilds.map((g) => (
+                                <div key={g.id}>
+                                  <div className={`pu-discordGuild${g.installed ? " ready" : ""}${discordRequestGuildId === g.id ? " pu-discordGuildActive" : ""}`}>
+                                    <div className="pu-discordGuildLeft">
+                                      <div className="pu-discordGuildName">{g.name}</div>
+                                      <div className="pu-discordGuildStatus">
+                                        {g.installed ? "✓ Bot ready" : g.can_manage ? "Add bot to use" : "Needs admin"}
+                                      </div>
+                                    </div>
+                                    {g.installed ? (
+                                      <button className="pu-btn pu-btnPrimary" type="button"
+                                        onClick={() => void fetchDiscordChannels(g.id)}>
+                                        Select →
+                                      </button>
+                                    ) : g.can_manage ? (
+                                      <button className="pu-btn" type="button" onClick={() => void installBot()}>
+                                        Add Bot
+                                      </button>
+                                    ) : (
+                                      <button
+                                        className={`pu-btn${discordRequestGuildId === g.id && discordRequestMessage ? " pu-btnActive" : ""}`}
+                                        type="button"
+                                        disabled={discordRequestLoading === g.id}
+                                        onClick={() => void requestAdminInstall(g)}
+                                      >
+                                        {discordRequestLoading === g.id ? "…" : discordRequestGuildId === g.id && discordRequestMessage ? "✓ Copied" : "Request"}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {/* Inline request panel — shown right under this guild */}
+                                  {discordRequestGuildId === g.id && discordRequestMessage && (
+                                    <div className="pu-discordRequest">
+                                      <div className="pu-discordRequestLabel">
+                                        Message copied to clipboard! Send it to the admin of <strong>{g.name}</strong>:
+                                      </div>
+                                      <div className="pu-discordRequestPreview">
+                                        {discordRequestMessage}
+                                      </div>
+                                      <div className="pu-discordRequestBtns">
+                                        <button className="pu-btn" type="button" onClick={() => void copyRequestMessage()}>
+                                          Copy again
+                                        </button>
+                                        {discordRequestInvite && (
+                                          <button className="pu-btn" type="button"
+                                            onClick={() => window.open(discordRequestInvite, "_blank", "noopener,noreferrer")}>
+                                            Open invite link
+                                          </button>
+                                        )}
+                                        <button className="pu-btn" style={{ marginLeft: "auto" }} type="button"
+                                          onClick={() => { setDiscordRequestGuildId(""); setDiscordRequestMessage(""); setDiscordRequestInvite(""); }}>
+                                          Dismiss
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Step 3: channel list */}
+                    {discordState === "connected" && selectedDiscordGuildId && !selectedDiscordChannelId && (
+                      <div className="pu-discordStep">
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                          <button className="pu-btn" style={{ height: 28, padding: "0 10px", fontSize: 11 }} type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setDiscordChannels([]); }}>
+                            ← Back
+                          </button>
+                          <div className="pu-discordStepLabel" style={{ margin: 0 }}>
+                            {selectedDiscordGuild?.name} — PICK A CHANNEL
+                          </div>
+                        </div>
+                        {discordChannelsLoading ? (
+                          <div className="pu-discordLoading"><div className="pu-discordSpinner" /><span>Loading channels…</span></div>
+                        ) : discordChannels.length === 0 ? (
+                          <div className="pu-discordEmpty">No text channels found. Make sure the bot has read access.</div>
+                        ) : (
+                          <div className="pu-discordChannels">
+                            {discordChannels.map((c) => (
+                              <button
+                                key={c.id}
+                                className={`pu-discordChan${selectedDiscordChannelId === c.id ? " active" : ""}`}
+                                type="button"
+                                onClick={() => setSelectedDiscordChannelId(c.id)}
+                              >
+                                # {c.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {selectedDiscordChannelId && !discordChannelsLoading && (
+                          <div style={{ marginTop: 10, fontSize: 12, color: "rgba(95,227,100,0.9)", fontWeight: 800 }}>
+                            ✓ #{discordChannels.find(c => c.id === selectedDiscordChannelId)?.name} selected — click Continue above to import.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className={`pu-drop${dragging ? " drag" : ""}`}>

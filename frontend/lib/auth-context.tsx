@@ -131,7 +131,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     gsiRef.current = true;
 
     function init() {
-      window.google?.accounts?.id?.initialize({
+      window.google?.accounts?.id?.initialize?.({
         client_id: GOOGLE_CLIENT_ID,
         callback: handleCredential,
         auto_select: false,
@@ -152,7 +152,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [handleCredential]);
 
   const signIn = useCallback(() => {
-    window.google?.accounts?.id?.prompt();
+    window.google?.accounts?.id?.prompt?.();
   }, []);
 
   const signOut = useCallback(async () => {

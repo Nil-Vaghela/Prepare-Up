@@ -21,7 +21,7 @@ const FEATURES = [
 
 export default function PodcastPage() {
   const router = useRouter();
-  const { accessToken } = useAuth();
+  const { accessToken, loading: authLoading } = useAuth();
   const [threads, setThreads] = useState<Thread[]>([]);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Thread | null>(null);
@@ -42,6 +42,7 @@ export default function PodcastPage() {
   const [duration, setDuration] = useState(0);
 
   useEffect(() => {
+    if (authLoading) return;
     fetch(`${BACKEND}/api/chat/threads`, {
       credentials: "include",
       headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
@@ -49,11 +50,16 @@ export default function PodcastPage() {
       .then(r => r.ok ? r.json() : { threads: [] })
       .then(d => setThreads(d.threads || []))
       .catch(() => {});
-  }, [accessToken]);
+  }, [accessToken, authLoading]);
 
+  // Cleanup blob URL only on unmount (not every time audioUrl changes — avoids revoke-before-play)
+  const audioUrlRef = useRef<string | null>(null);
+  audioUrlRef.current = audioUrl;
   useEffect(() => {
-    return () => { if (audioUrl) URL.revokeObjectURL(audioUrl); };
-  }, [audioUrl]);
+    return () => {
+      if (audioUrlRef.current?.startsWith("blob:")) URL.revokeObjectURL(audioUrlRef.current);
+    };
+  }, []);
 
   const filtered = threads.filter(t =>
     (t.title || "Untitled").toLowerCase().includes(query.toLowerCase())
@@ -98,7 +104,7 @@ export default function PodcastPage() {
       setError(e instanceof Error ? e.message : "Generation failed.");
       setView("select");
     }
-  }, [audioUrl]);
+  }, [audioUrl, accessToken]);
 
   const onGenerateAudio = useCallback(async () => {
     if (!script.length) return;
