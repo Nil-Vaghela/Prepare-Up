@@ -19,7 +19,10 @@ def verify_google_id_token(id_token: str) -> GoogleProfile:
     
     client_id = os.getenv("GOOGLE_CLIENT_ID")
     if not client_id:
-        raise ValueError("Missing GOOGLE_CLIENT_ID in environment.")
+        raise RuntimeError(
+            "GOOGLE_CLIENT_ID is not configured. "
+            "Add GOOGLE_CLIENT_ID=<your-client-id> to your .env file and restart."
+        )
 
     try:
         # This verifies signature, expiry, issuer, and audience (client_id).

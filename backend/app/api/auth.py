@@ -102,6 +102,9 @@ async def login_with_google(
             id_token=payload.id_token,
             session_id=request.cookies.get("pu_session_id"),
         )
+    except RuntimeError as e:
+        # Configuration error (missing env vars) — not the user's fault
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 

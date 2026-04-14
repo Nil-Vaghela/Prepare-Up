@@ -1,5 +1,7 @@
 .env
 .env.*
+!.env.defaults
+!.env.example
 .venv
 .DS_Store.DS_Store
 .DS_Store
