@@ -29,18 +29,33 @@ def _run_migrations() -> None:
     This avoids requiring a manual `alembic upgrade head` and ensures
     migrations run inside the Docker network where DB DNS resolution works.
     """
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        logger.error(
+            "DATABASE_URL is not set — Alembic migrations will NOT run. "
+            "Create a .env file from .env.example and restart."
+        )
+        return
+
     try:
         from alembic.config import Config
         from alembic import command
 
         alembic_cfg = Config("/app/alembic.ini")
-        alembic_cfg.set_main_option("sqlalchemy.url", os.environ["DATABASE_URL"])
+        alembic_cfg.set_main_option("sqlalchemy.url", db_url)
         command.upgrade(alembic_cfg, "head")
         logger.info("Alembic migrations applied successfully.")
     except Exception as exc:
-        # Log but do not crash — if tables already exist this is non-fatal,
-        # and we don't want a migration hiccup to take down the whole service.
-        logger.warning("Alembic migration step encountered an issue: %s", exc)
+        # Log the full error prominently so it's visible in docker compose logs.
+        # Do NOT crash — if tables already exist, Alembic returns without error.
+        # Only truly unrecoverable states (corrupt alembic_version, etc.) land here.
+        logger.error(
+            "Alembic migration failed — the database may be missing tables. "
+            "Run: docker compose down -v && docker compose up --build\n"
+            "Error: %s",
+            exc,
+            exc_info=True,
+        )
 
 
 app = FastAPI(title=settings.APP_NAME, on_startup=[_run_migrations])
