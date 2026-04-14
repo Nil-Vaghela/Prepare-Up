@@ -11,7 +11,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U prepareup -d prepareup"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-prepareup} -d ${POSTGRES_DB:-prepareup}"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -21,13 +21,13 @@ services:
       context: ./backend
     container_name: prepareup_backend
     environment:
+      # Infrastructure vars — always set, use Postgres service name "db"
       ENV: local
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-prepareup}:${POSTGRES_PASSWORD:-prepareup_password}@db:5432/${POSTGRES_DB:-prepareup}
-      CORS_ORIGINS: http://localhost:3000
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
     env_file:
-      - path: ./.env
-        required: false   # Collaborators without .env get safe defaults; override for production
-      
+      - ./.env.defaults     # safe non-secret defaults — committed to repo, always present
+      - ./.env              # real secrets — gitignored, overrides defaults (copy from .env.example)
     ports:
       - "8000:8000"
     volumes:
@@ -41,9 +41,9 @@ services:
       context: ./frontend
     container_name: prepareup_frontend
     environment:
-      # Next.js can read this at runtime/build-time depending on usage
       NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
-      NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID}
+      NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8000}
+      NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${NEXT_PUBLIC_GOOGLE_CLIENT_ID:-}
     ports:
       - "3000:3000"
     volumes:
