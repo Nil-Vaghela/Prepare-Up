@@ -1,811 +1,320 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import AnimatedBackground from "../../components/AnimatedBackground";
+import { useAuth } from "../../lib/auth-context";
 
-const mockSections = [
-  {
-    title: "Big-picture overview",
-    subtitle: "Start here to understand the full topic before memorizing details.",
-    body:
-      "This study guide turns your selected source into a clean review flow: core ideas first, then high-yield details, then likely test points. Use it as a fast revision sheet before class, quizzes, or exams.",
-  },
-  {
-    title: "Core concepts",
-    subtitle: "The ideas you should be able to explain in simple language.",
-    body:
-      "Focus on understanding the main definitions, relationships, and cause-and-effect patterns in the material. If you can teach these concepts out loud without reading, you are in a strong position for both multiple-choice and short-answer questions.",
-  },
-  {
-    title: "What to memorize",
-    subtitle: "High-retention details that are likely to matter during recall.",
-    bullets: [
-      {
-        label: "Definitions",
-        text: "Know the exact meaning of the most important terms and when each one applies.",
-      },
-      {
-        label: "Processes",
-        text: "Be able to describe the order of steps clearly and identify why each step matters.",
-      },
-      {
-        label: "Comparisons",
-        text: "Practice comparing related ideas so you can quickly distinguish them under exam pressure.",
-      },
-    ],
-  },
-  {
-    title: "Likely exam focus",
-    subtitle: "Use this section to prioritize your review when time is limited.",
-    body:
-      "Spend most of your time on foundational concepts, repeated themes, and anything that connects definitions to examples. If your instructor emphasizes applications, make sure you can use the content in a scenario rather than only recognizing vocabulary.",
-  },
+const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+
+type Thread = { id: string; title: string | null; updated_at: string; source_session_id: string | null; source_files: Array<{ name: string }> };
+type Section = { heading: string; bullets: string[] };
+type ViewState = "select" | "generating" | "reading";
+
+const FEATURES = [
+  { href: "/flashcard",  label: "Flash Cards", icon: "⊞" },
+  { href: "/podcast",    label: "Podcast",     icon: "🎙" },
+  { href: "/mockquiz",   label: "Mock Test",   icon: "✎" },
+  { href: "/studyguide", label: "Study Guide", icon: "≡" },
 ];
 
-export default function StudyGuidePage() {
-  const [focusValue, setFocusValue] = useState("");
-  const [isRefining, setIsRefining] = useState(false);
-  const [appliedFocus, setAppliedFocus] = useState("");
+function parseGuide(text: string): Section[] {
+  const lines = text.split("\n");
+  const sections: Section[] = [];
+  let current: Section | null = null;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("## ") || line.startsWith("# ")) {
+      if (current) sections.push(current);
+      current = { heading: line.replace(/^#+\s*/, ""), bullets: [] };
+    } else if (line.startsWith("- ") || line.startsWith("* ") || line.startsWith("• ")) {
+      if (!current) current = { heading: "Overview", bullets: [] };
+      current.bullets.push(line.replace(/^[-*•]\s*/, ""));
+    } else if (current) {
+      // Non-bullet line under a heading — treat as a paragraph bullet
+      current.bullets.push(line);
+    } else {
+      // Before any heading
+      current = { heading: "Overview", bullets: [line] };
+    }
+  }
+  if (current && (current.bullets.length > 0 || current.heading)) sections.push(current);
+  return sections.length ? sections : [{ heading: "Study Guide", bullets: [text] }];
+}
 
-  const studyMeta = useMemo(
-    () => [
-      "Study guide",
-      appliedFocus ? `Focused on: ${appliedFocus}` : "Balanced review",
-      "Ready to refine",
-    ],
-    [appliedFocus]
+export default function StudyGuidePage() {
+  const router = useRouter();
+  const { accessToken, loading: authLoading } = useAuth();
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState<Thread | null>(null);
+  const [sections, setSections] = useState<Section[]>([]);
+  const [rawText, setRawText] = useState("");
+  const [view, setView] = useState<ViewState>("select");
+  const [error, setError] = useState("");
+  const [activeSection, setActiveSection] = useState(0);
+
+  useEffect(() => {
+    if (authLoading) return;
+    fetch(`${BACKEND}/api/chat/threads`, {
+      credentials: "include",
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+    })
+      .then(r => r.ok ? r.json() : { threads: [] })
+      .then(d => setThreads(d.threads || []))
+      .catch(() => {});
+  }, [accessToken, authLoading]);
+
+  const filtered = threads.filter(t =>
+    (t.title || "Untitled").toLowerCase().includes(query.toLowerCase())
   );
 
-  const onRefocus = () => {
-    const value = focusValue.trim();
-    if (!value) return;
-    setIsRefining(true);
-    window.setTimeout(() => {
-      setAppliedFocus(value);
-      setIsRefining(false);
-    }, 500);
+  const generate = useCallback(async (thread: Thread) => {
+    const sid = thread.source_session_id;
+    if (!sid) { setError("This chat has no uploaded content to generate from."); return; }
+    setSelected(thread);
+    setView("generating");
+    setError("");
+    try {
+      const res = await fetch(`${BACKEND}/api/generate`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({ session_id: sid, output_type: "study_guide" }),
+      });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Generation failed"); }
+      const data = await res.json();
+      // generate endpoint returns {type: "study_guide", text: "..."}
+      const text: string = data.text || data.guide || data.content || "";
+      if (!text.trim()) throw new Error("The AI could not generate a study guide from this content. Make sure the chat has uploaded documents with sufficient text.");
+      setRawText(text);
+      setSections(parseGuide(text));
+      setActiveSection(0);
+      setView("reading");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Generation failed.");
+      setView("select");
+    }
+  }, [accessToken]);
+
+  const downloadGuide = () => {
+    const blob = new Blob([rawText], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `study-guide-${selected?.title || "guide"}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
     <>
-      <div className="pu-bg" />
-      <div className="pu-vignette" />
+      <AnimatedBackground />
+      <div className="sg-root">
+        {/* ── Sidebar ── */}
+        <aside className="sg-glass sg-sidebar">
+          <div className="sg-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+          <div className="sg-sectionLabel">MAIN</div>
+          <nav className="sg-nav">
+            {FEATURES.map(f => (
+              <div key={f.href} className={`sg-navItem${f.href === "/studyguide" ? " active" : ""}`} onClick={() => router.push(f.href)}>
+                <span className="sg-navIcon">{f.icon}</span>
+                <span>{f.label}</span>
+              </div>
+            ))}
+          </nav>
 
-      <div className="pu-root">
-        <div className="pu-shell">
-          <aside className="pu-glass pu-sidebar">
-            <div className="pu-brandRow">
-              <div className="pu-brand">PrepareUp</div>
-              <button className="pu-btn" type="button">
-                Back
+          {view === "reading" ? (
+            <>
+              <div className="sg-sectionLabel" style={{ marginTop: 18 }}>INCLUDED SECTIONS</div>
+              <div className="sg-list">
+                {sections.map((s, i) => (
+                  <div
+                    key={i}
+                    className={`sg-thread${activeSection === i ? " active" : ""}`}
+                    onClick={() => setActiveSection(i)}
+                  >
+                    <div className="sg-threadTitle">{s.heading}</div>
+                    <div className="sg-threadSub">{s.bullets.length} point{s.bullets.length !== 1 ? "s" : ""}</div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <button className="sg-newChat" onClick={() => router.push("/dashboard")}>
+                <span>+</span> New Chat
               </button>
+              <div className="sg-sectionLabel" style={{ marginTop: 14 }}>RECENTS</div>
+              <input
+                className="sg-search"
+                placeholder="Search chats…"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+              />
+              <div className="sg-list">
+                {filtered.map(t => (
+                  <div
+                    key={t.id}
+                    className={`sg-thread${selected?.id === t.id ? " active" : ""}`}
+                    onClick={() => generate(t)}
+                  >
+                    <div className="sg-threadTitle">{t.title || "Untitled chat"}</div>
+                    <div className="sg-threadSub">{t.source_files?.map(f => f.name).join(", ") || "No files"}</div>
+                  </div>
+                ))}
+                {!filtered.length && (
+                  <div className="sg-empty">No chats yet. Upload content from the dashboard first.</div>
+                )}
+              </div>
+            </>
+          )}
+        </aside>
+
+        {/* ── Main ── */}
+        <main className="sg-glass sg-main">
+          {view === "select" && (
+            <div className="sg-centerState">
+              <div className="sg-centerIcon">≡</div>
+              <div className="sg-centerTitle">Study Guide Workspace</div>
+              <div className="sg-centerSub">Select a chat from the sidebar to generate a structured study guide from your notes.</div>
+              {error && <div className="sg-error">{error}</div>}
             </div>
+          )}
 
-            <div className="pu-sectionLabel">Outputs</div>
-            <div className="pu-sideNav">
-              <div className="pu-sideItem active">
-                <div className="pu-sideIcon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
-                    <path d="M5.5 6.5A2.5 2.5 0 0 1 8 4h10.5v15H8a2.5 2.5 0 0 0-2.5 2.5" />
-                    <path d="M5.5 6.5V20" />
-                    <path d="M9.5 8h6" />
-                    <path d="M9.5 11h6" />
-                  </svg>
-                </div>
-                <div className="pu-sideLabel">Study guide</div>
-              </div>
-              <div className="pu-sideItem">
-                <div className="pu-sideIcon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
-                    <path d="M4 13a8 8 0 0 1 16 0" />
-                    <rect x="4" y="13" width="3.5" height="6" rx="1.5" />
-                    <rect x="16.5" y="13" width="3.5" height="6" rx="1.5" />
-                    <path d="M7.5 19a4.5 4.5 0 0 0 9 0" />
-                  </svg>
-                </div>
-                <div className="pu-sideLabel">Podcast</div>
-              </div>
-              <div className="pu-sideItem">
-                <div className="pu-sideIcon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
-                    <rect x="5" y="7" width="11" height="8" rx="2" />
-                    <path d="M9 5h10v8" />
-                    <path d="M8.5 10.5h4" />
-                  </svg>
-                </div>
-                <div className="pu-sideLabel">Flashcards</div>
-              </div>
-              <div className="pu-sideItem">
-                <div className="pu-sideIcon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
-                    <path d="M8 4h8l4 4v12H8z" />
-                    <path d="M16 4v4h4" />
-                    <path d="M11 13h6" />
-                    <path d="M11 17h6" />
-                  </svg>
-                </div>
-                <div className="pu-sideLabel">Summary</div>
-              </div>
+          {view === "generating" && (
+            <div className="sg-centerState">
+              <div className="sg-spinner" />
+              <div className="sg-centerTitle">Generating study guide…</div>
+              <div className="sg-centerSub">Structuring key concepts from "{selected?.title || "your chat"}"</div>
             </div>
+          )}
 
-            <div className="pu-sectionLabel">Included sections</div>
-            <div className="pu-list">
-              {mockSections.map((section) => (
-                <div className="pu-itemCompact" key={section.title}>
-                  <div className="pu-itemTitle">{section.title}</div>
-                  <div className="pu-itemSub">{section.subtitle}</div>
-                </div>
-              ))}
-            </div>
-          </aside>
-
-          <main className="pu-glass pu-main">
-            <div className="pu-topbar">
-              <div>
-                <div className="pu-userHint">Selected output</div>
-                <div className="pu-userName">Study guide</div>
-              </div>
-
-              <div className="pu-userChip">
-                <div className="pu-avatar">RP</div>
+          {view === "reading" && sections.length > 0 && (
+            <div className="sg-workspace">
+              {/* Header */}
+              <div className="sg-wsHeader">
                 <div>
-                  <div className="pu-userHint">Workspace</div>
-                  <div className="pu-userName">PrepareUp</div>
+                  <div className="sg-wsEyebrow">STUDY GUIDE</div>
+                  <div className="sg-wsTitle">{selected?.title || "Your notes"}</div>
+                </div>
+                <div className="sg-headerActions">
+                  <button className="sg-actionBtn" onClick={downloadGuide}>↓ Download</button>
+                  <button className="sg-backBtn" onClick={() => { setView("select"); setSelected(null); }}>← Back to Chats</button>
                 </div>
               </div>
-            </div>
 
-            <div className="pu-content">
-              <div className="pu-studyShell">
-                <section className="pu-studyHero">
-                  <div className="pu-studyTop">
-                    <div>
-                      <div className="pu-studyEyebrow">Generated from your selected chat</div>
-                      <div className="pu-studyTitle">Your study guide is ready</div>
-                      <div className="pu-studySub">
-                        Review the guide below. If it misses the angle you care about, use the refocus area to tell us what this
-                        version should emphasize, such as formulas, definitions, exam questions, examples, or concise revision.
-                      </div>
+              {/* Hero card */}
+              <div className="sg-heroCard">
+                <div className="sg-heroIcon">📚</div>
+                <div className="sg-heroBody">
+                  <div className="sg-heroTitle">Ready to study</div>
+                  <div className="sg-heroSub">{sections.length} sections · {sections.reduce((n, s) => n + s.bullets.length, 0)} key points · Navigate sections in the sidebar</div>
+                </div>
+              </div>
 
-                      <div className="pu-studyMetaRow">
-                        {studyMeta.map((item) => (
-                          <div className="pu-studyChip" key={item}>
-                            {item}
-                          </div>
+              {/* Sections */}
+              <div className="sg-sections">
+                {sections.map((s, i) => (
+                  <div key={i} id={`section-${i}`} className={`sg-sectionCard${activeSection === i ? " highlight" : ""}`}>
+                    <div className="sg-secHeader" onClick={() => setActiveSection(activeSection === i ? -1 : i)}>
+                      <div className="sg-secNum">{String(i + 1).padStart(2, "0")}</div>
+                      <div className="sg-secHeading">{s.heading}</div>
+                      <div className="sg-secCount">{s.bullets.length} pt</div>
+                      <div className="sg-secChevron">{activeSection === i ? "▲" : "▼"}</div>
+                    </div>
+                    {(activeSection === i || activeSection === -1) && (
+                      <ul className="sg-bullets">
+                        {s.bullets.map((b, j) => (
+                          <li key={j} className="sg-bullet">{b}</li>
                         ))}
-                      </div>
-                    </div>
-
-                    <div className="pu-studyActions">
-                      <button className="pu-btn" type="button">
-                        Download
-                      </button>
-                      <button
-                        className="pu-btn pu-btnPrimary"
-                        type="button"
-                        onClick={onRefocus}
-                        disabled={!focusValue.trim() || isRefining}
-                      >
-                        {isRefining ? "Updating..." : "Refocus guide"}
-                      </button>
-                    </div>
+                      </ul>
+                    )}
                   </div>
-                </section>
+                ))}
+              </div>
 
-                <section className="pu-studyBody">
-                  {mockSections.map((section) => (
-                    <div className="pu-studyCard" key={section.title}>
-                      <div className="pu-studySectionTitle">{section.title}</div>
-                      <div className="pu-studySectionSub">{section.subtitle}</div>
-
-                      {section.body ? <div className="pu-studyText">{section.body}</div> : null}
-
-                      {section.bullets ? (
-                        <div className="pu-studyList">
-                          {section.bullets.map((bullet) => (
-                            <div className="pu-studyListItem" key={bullet.label}>
-                              <div className="pu-studyListLabel">{bullet.label}</div>
-                              <div className="pu-studyListText">{bullet.text}</div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </section>
-
-                <div>
-                  <div className="pu-focusBar">
-                    <div>
-                      <textarea
-                        className="pu-focusInput"
-                        value={focusValue}
-                        onChange={(e) => setFocusValue(e.target.value)}
-                        placeholder="Didn’t like this version? Tell us what to focus on — examples, formulas, exam prep, concise revision, definitions, likely questions..."
-                      />
-                      <div className="pu-focusHint">
-                        Example: “Focus more on key definitions and likely exam-style questions.”
-                      </div>
-                    </div>
-
-                    <button
-                      className={`pu-btn pu-btnPrimary ${!focusValue.trim() || isRefining ? "pu-btnDisabled" : ""}`}
-                      type="button"
-                      disabled={!focusValue.trim() || isRefining}
-                      onClick={onRefocus}
-                    >
-                      {isRefining ? "Regenerating..." : "Regenerate"}
-                    </button>
-                  </div>
-                </div>
+              {/* Nav buttons */}
+              <div className="sg-navBtns">
+                <button className="sg-ctrlBtn" disabled={activeSection <= 0} onClick={() => setActiveSection(a => Math.max(0, a - 1))}>← Previous Section</button>
+                <button className="sg-ctrlBtn sg-ctrlAccent" disabled={activeSection >= sections.length - 1} onClick={() => setActiveSection(a => Math.min(sections.length - 1, a + 1))}>Next Section →</button>
               </div>
             </div>
-          </main>
-        </div>
+          )}
+        </main>
       </div>
 
       <style jsx>{`
-        :global(:root) {
-          --pu-bg: #07070b;
-          --pu-text: rgba(255, 255, 255, 0.92);
-          --pu-muted: rgba(255, 255, 255, 0.62);
-          --pu-accent-1: #5aa8ff;
-          --pu-accent-2: #5fe3ff;
-          --pu-accent-3: #7c8cff;
-          --pu-font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
-            Arial, "Apple Color Emoji", "Segoe UI Emoji";
-          --pu-radius-lg: 22px;
-          --pu-radius-md: 18px;
-          --pu-radius-sm: 14px;
-          --pu-border: rgba(255, 255, 255, 0.1);
-          --pu-border-2: rgba(255, 255, 255, 0.14);
-          --pu-surface: rgba(255, 255, 255, 0.03);
-          --pu-surface-2: rgba(255, 255, 255, 0.045);
-          --pu-shadow: 0 18px 60px rgba(0, 0, 0, 0.46);
-          --pu-shadow-soft: 0 10px 26px rgba(0, 0, 0, 0.28);
-        }
-
-        .pu-bg {
-          position: fixed;
-          inset: 0;
-          z-index: 0;
-          background: var(--pu-bg);
-        }
-
-        .pu-vignette {
-          position: fixed;
-          inset: 0;
-          z-index: 1;
-          pointer-events: none;
-          background: radial-gradient(80% 70% at 50% 35%, rgba(90, 168, 255, 0), rgba(0, 0, 0, 0.55));
-        }
-
-        .pu-root {
-          position: relative;
-          height: 100vh;
-          padding: 14px;
-          overflow: hidden;
-          color: var(--pu-text);
-          font-family: var(--pu-font-sans);
-          -webkit-font-smoothing: antialiased;
-          -moz-osx-font-smoothing: grayscale;
-          text-rendering: optimizeLegibility;
-        }
-
-        .pu-root::after {
-          content: "";
-          position: fixed;
-          inset: 0;
-          pointer-events: none;
-          z-index: 1;
-          opacity: 0.1;
-          background-image: radial-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px);
-          background-size: 5px 5px;
-          mix-blend-mode: overlay;
-        }
-
-        .pu-shell {
-          position: relative;
-          z-index: 2;
-          height: 100%;
-          display: grid;
-          grid-template-columns: 340px 1fr;
-          gap: 14px;
-          min-width: 0;
-        }
-
-        .pu-glass {
-          position: relative;
-          border-radius: var(--pu-radius-lg);
-          border: 1px solid var(--pu-border);
-          background: rgba(10, 12, 18, 0.36);
-          -webkit-backdrop-filter: blur(14px) saturate(140%);
-          backdrop-filter: blur(14px) saturate(140%);
-          box-shadow: var(--pu-shadow);
-          overflow: hidden;
-          will-change: backdrop-filter;
-        }
-
-        @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-          .pu-glass {
-            background: rgba(10, 12, 18, 0.62);
-          }
-        }
-
-        .pu-glass::before {
-          content: "";
-          position: absolute;
-          inset: 0;
-          pointer-events: none;
-          z-index: 1;
-          background: radial-gradient(60% 40% at 28% 10%, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0) 60%),
-            radial-gradient(50% 36% at 86% 12%, rgba(95, 227, 255, 0.1), rgba(0, 0, 0, 0) 62%);
-          opacity: 0.22;
-        }
-
-        .pu-glass::after {
-          content: "";
-          position: absolute;
-          inset: 0;
-          pointer-events: none;
-          z-index: 1;
-          background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0) 34%);
-          opacity: 0.35;
-        }
-
-        .pu-glass > * {
-          position: relative;
-          z-index: 2;
-        }
-
-        .pu-btn {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 8px;
-          height: 38px;
-          padding: 0 14px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
-          color: rgba(255, 255, 255, 0.92);
-          font-size: 12px;
-          font-weight: 900;
-          cursor: pointer;
-          transition: transform 160ms ease, background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
-          white-space: nowrap;
-        }
-
-        .pu-btn:hover {
-          transform: translateY(-1px);
-          background: rgba(255, 255, 255, 0.06);
-          border-color: rgba(95, 227, 255, 0.22);
-          box-shadow: var(--pu-shadow-soft);
-        }
-
-        .pu-btnPrimary {
-          border-color: rgba(95, 227, 255, 0.16);
-          background: linear-gradient(90deg, rgba(90, 168, 255, 0.95), rgba(95, 227, 255, 0.95));
-          color: rgba(0, 0, 0, 0.92);
-        }
-
-        .pu-btnDisabled {
-          opacity: 0.45;
-          cursor: not-allowed;
-          transform: none !important;
-          box-shadow: none !important;
-        }
-
-        .pu-sidebar {
-          padding: 14px;
-          display: flex;
-          flex-direction: column;
-          min-height: 0;
-        }
-
-        .pu-brandRow {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-        }
-
-        .pu-brand {
-          font-weight: 950;
-          letter-spacing: -0.02em;
-          background: linear-gradient(90deg, var(--pu-accent-1), var(--pu-accent-2));
-          -webkit-background-clip: text;
-          background-clip: text;
-          color: transparent;
-          font-size: 14px;
-        }
-
-        .pu-sectionLabel {
-          margin-top: 14px;
-          font-size: 10px;
-          font-weight: 900;
-          letter-spacing: 0.1em;
-          text-transform: uppercase;
-          color: rgba(255, 255, 255, 0.48);
-        }
-
-        .pu-sideNav {
-          margin-top: 10px;
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-        }
-
-        .pu-sideItem {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          padding: 12px;
-          border-radius: var(--pu-radius-md);
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          background: rgba(10, 12, 18, 0.26);
-          -webkit-backdrop-filter: blur(12px) saturate(140%);
-          backdrop-filter: blur(12px) saturate(140%);
-          cursor: pointer;
-          user-select: none;
-          transition: transform 160ms ease, background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
-          position: relative;
-          overflow: hidden;
-        }
-
-        .pu-sideItem:hover {
-          transform: translateY(-1px);
-          background: rgba(255, 255, 255, 0.045);
-          border-color: rgba(95, 227, 255, 0.2);
-          box-shadow: var(--pu-shadow-soft);
-        }
-
-        .pu-sideItem.active {
-          border-color: rgba(95, 227, 255, 0.26);
-          background: rgba(255, 255, 255, 0.05);
-          box-shadow: 0 24px 70px rgba(0, 0, 0, 0.4);
-        }
-
-        .pu-sideItem.active::before {
-          content: "";
-          position: absolute;
-          left: 10px;
-          top: 10px;
-          bottom: 10px;
-          width: 3px;
-          border-radius: 999px;
-          background: linear-gradient(180deg, var(--pu-accent-2), var(--pu-accent-1));
-          box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 0 24px rgba(95, 227, 255, 0.22);
-        }
-
-        .pu-sideIcon {
-          width: 18px;
-          height: 18px;
-          display: grid;
-          place-items: center;
-          color: rgba(255, 255, 255, 0.72);
-        }
-
-        .pu-sideLabel {
-          font-size: 12px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.88);
-        }
-
-        .pu-list {
-          margin-top: 12px;
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          overflow: auto;
-          min-height: 0;
-          padding-right: 6px;
-        }
-
-        .pu-itemCompact {
-          padding: 10px 12px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          background: rgba(255, 255, 255, 0.03);
-          transition: transform 140ms ease, background 140ms ease, border-color 140ms ease;
-        }
-
-        .pu-itemCompact:hover {
-          background: rgba(255, 255, 255, 0.045);
-          border-color: rgba(255, 255, 255, 0.14);
-          transform: translateY(-1px);
-        }
-
-        .pu-itemTitle {
-          font-size: 12px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.9);
-        }
-
-        .pu-itemSub {
-          margin-top: 4px;
-          font-size: 11px;
-          color: var(--pu-muted);
-        }
-
-        .pu-main {
-          display: flex;
-          flex-direction: column;
-          overflow: hidden;
-          min-width: 0;
-        }
-
-        .pu-topbar {
-          padding: 14px;
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-        }
-
-        .pu-userChip {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          padding: 8px 10px;
-          border-radius: 14px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.03);
-        }
-
-        .pu-avatar {
-          width: 30px;
-          height: 30px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          background: rgba(255, 255, 255, 0.05);
-          display: grid;
-          place-items: center;
-          font-weight: 950;
-          font-size: 12px;
-          color: rgba(255, 255, 255, 0.92);
-        }
-
-        .pu-userHint {
-          font-size: 10px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.6);
-          text-transform: uppercase;
-          line-height: 1.1;
-        }
-
-        .pu-userName {
-          font-size: 11px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.92);
-          line-height: 1.1;
-        }
-
-        .pu-content {
-          flex: 1;
-          min-height: 0;
-          overflow: hidden;
-          padding: 14px;
-          position: relative;
-        }
-
-        .pu-studyShell {
-          height: 100%;
-          display: grid;
-          grid-template-rows: auto 1fr auto;
-          gap: 14px;
-          min-height: 0;
-        }
-
-        .pu-studyHero {
-          padding: 18px;
-          border-radius: var(--pu-radius-lg);
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          background: rgba(10, 12, 18, 0.3);
-          -webkit-backdrop-filter: blur(16px) saturate(140%);
-          backdrop-filter: blur(16px) saturate(140%);
-          box-shadow: var(--pu-shadow-soft);
-          position: relative;
-          overflow: hidden;
-        }
-
-        .pu-studyHero::before {
-          content: "";
-          position: absolute;
-          inset: 0;
-          pointer-events: none;
-          background: radial-gradient(58% 42% at 18% 12%, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0) 64%),
-            radial-gradient(46% 34% at 86% 12%, rgba(95, 227, 255, 0.1), rgba(0, 0, 0, 0) 68%);
-          opacity: 0.24;
-        }
-
-        .pu-studyHero > * {
-          position: relative;
-          z-index: 1;
-        }
-
-        .pu-studyTop {
-          display: flex;
-          align-items: flex-start;
-          justify-content: space-between;
-          gap: 16px;
-          flex-wrap: wrap;
-        }
-
-        .pu-studyEyebrow {
-          font-size: 10px;
-          font-weight: 900;
-          letter-spacing: 0.1em;
-          text-transform: uppercase;
-          color: rgba(255, 255, 255, 0.5);
-        }
-
-        .pu-studyTitle {
-          margin-top: 8px;
-          font-size: 22px;
-          line-height: 1.1;
-          font-weight: 950;
-          letter-spacing: -0.03em;
-          color: rgba(255, 255, 255, 0.94);
-        }
-
-        .pu-studySub {
-          margin-top: 8px;
-          max-width: 70ch;
-          font-size: 13px;
-          line-height: 1.6;
-          color: rgba(255, 255, 255, 0.68);
-        }
-
-        .pu-studyMetaRow {
-          margin-top: 14px;
-          display: flex;
-          gap: 10px;
-          flex-wrap: wrap;
-        }
-
-        .pu-studyChip {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          height: 32px;
-          padding: 0 12px;
-          border-radius: 999px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
-          color: rgba(255, 255, 255, 0.82);
-          font-size: 11px;
-          font-weight: 900;
-        }
-
-        .pu-studyActions {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          flex-wrap: wrap;
-        }
-
-        .pu-studyBody {
-          min-height: 0;
-          overflow: auto;
-          padding-right: 6px;
-          display: grid;
-          gap: 14px;
-        }
-
-        .pu-studyCard {
-          padding: 18px;
-          border-radius: var(--pu-radius-lg);
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          background: rgba(10, 12, 18, 0.28);
-          -webkit-backdrop-filter: blur(14px) saturate(140%);
-          backdrop-filter: blur(14px) saturate(140%);
-          box-shadow: var(--pu-shadow-soft);
-        }
-
-        .pu-studySectionTitle {
-          font-size: 13px;
-          font-weight: 950;
-          letter-spacing: -0.01em;
-          color: rgba(255, 255, 255, 0.92);
-        }
-
-        .pu-studySectionSub {
-          margin-top: 6px;
-          font-size: 11px;
-          line-height: 1.5;
-          color: rgba(255, 255, 255, 0.62);
-        }
-
-        .pu-studyText {
-          margin-top: 12px;
-          font-size: 14px;
-          line-height: 1.7;
-          color: rgba(255, 255, 255, 0.86);
-          white-space: pre-wrap;
-        }
-
-        .pu-studyList {
-          margin-top: 12px;
-          display: grid;
-          gap: 10px;
-        }
-
-        .pu-studyListItem {
-          padding: 12px 14px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          background: rgba(255, 255, 255, 0.03);
-        }
-
-        .pu-studyListLabel {
-          font-size: 12px;
-          font-weight: 900;
-          color: rgba(255, 255, 255, 0.9);
-        }
-
-        .pu-studyListText {
-          margin-top: 6px;
-          font-size: 13px;
-          line-height: 1.6;
-          color: rgba(255, 255, 255, 0.74);
-        }
-
-        .pu-focusBar {
-          display: grid;
-          grid-template-columns: 1fr auto;
-          gap: 10px;
-          align-items: center;
-          padding: 14px;
-          border-radius: var(--pu-radius-md);
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(10, 12, 18, 0.3);
-          -webkit-backdrop-filter: blur(14px) saturate(140%);
-          backdrop-filter: blur(14px) saturate(140%);
-        }
-
-        .pu-focusInput {
-          width: 100%;
-          min-height: 44px;
-          max-height: 120px;
-          padding: 12px 14px;
-          border-radius: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.12);
-          background: rgba(255, 255, 255, 0.04);
-          color: rgba(255, 255, 255, 0.92);
-          font-size: 13px;
-          line-height: 1.5;
-          outline: none;
-          resize: vertical;
-        }
-
-        .pu-focusInput::placeholder {
-          color: rgba(255, 255, 255, 0.42);
-        }
-
-        .pu-focusHint {
-          margin-top: 8px;
-          font-size: 11px;
-          color: rgba(255, 255, 255, 0.56);
-        }
-
-        @media (max-width: 980px) {
-          .pu-shell {
-            grid-template-columns: 1fr;
-          }
-
-          .pu-sidebar {
-            display: none;
-          }
-
-          .pu-studyTop {
-            flex-direction: column;
-          }
-
-          .pu-focusBar {
-            grid-template-columns: 1fr;
-          }
-        }
+        :global(body){margin:0;background:#07070b;}
+        .sg-root{position:relative;z-index:1;display:grid;grid-template-columns:240px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
+        .sg-glass{border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.5);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);box-shadow:0 20px 60px rgba(0,0,0,0.5);}
+        .sg-sidebar{padding:16px;display:flex;flex-direction:column;min-height:0;overflow:hidden;}
+        .sg-main{overflow-y:auto;padding:0;}
+        .sg-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:14px;}
+        .sg-sectionLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;}
+        .sg-nav{display:flex;flex-direction:column;gap:4px;}
+        .sg-navItem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:700;color:rgba(255,255,255,0.75);transition:all 130ms;}
+        .sg-navItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.08);}
+        .sg-navItem.active{background:rgba(255,255,255,0.06);border-color:rgba(95,227,255,0.25);color:rgba(255,255,255,0.95);}
+        .sg-navIcon{font-size:14px;width:18px;text-align:center;}
+        .sg-search{margin-top:4px;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;font-size:12px;color:rgba(255,255,255,0.85);outline:none;}
+        .sg-search::placeholder{color:rgba(255,255,255,0.35);}
+        .sg-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
+        .sg-thread{padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,0.06);background:rgba(255,255,255,0.02);cursor:pointer;transition:all 130ms;}
+        .sg-thread:hover{background:rgba(255,255,255,0.05);border-color:rgba(95,227,255,0.18);}
+        .sg-thread.active{border-color:rgba(95,227,255,0.3);background:rgba(95,227,255,0.06);}
+        .sg-threadTitle{font-size:12px;font-weight:800;color:rgba(255,255,255,0.88);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .sg-threadSub{font-size:10px;color:rgba(255,255,255,0.42);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .sg-empty{font-size:12px;color:rgba(255,255,255,0.4);padding:12px 0;text-align:center;line-height:1.5;}
+        .sg-newChat{width:100%;margin-top:10px;height:36px;border-radius:12px;border:1px dashed rgba(255,255,255,0.18);background:rgba(255,255,255,0.03);color:rgba(255,255,255,0.72);font-size:12px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:all 130ms;}
+        .sg-newChat:hover{background:rgba(95,227,255,0.06);border-color:rgba(95,227,255,0.35);color:rgba(255,255,255,0.92);}
+        /* Center states */
+        .sg-centerState{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:16px;padding:40px;text-align:center;}
+        .sg-centerIcon{font-size:48px;line-height:1;}
+        .sg-centerTitle{font-size:22px;font-weight:950;letter-spacing:-0.02em;color:rgba(255,255,255,0.94);}
+        .sg-centerSub{font-size:14px;color:rgba(255,255,255,0.55);line-height:1.6;max-width:420px;}
+        .sg-error{font-size:13px;color:#ff6b6b;padding:10px 16px;border-radius:12px;border:1px solid rgba(255,107,107,0.2);background:rgba(255,107,107,0.07);}
+        .sg-spinner{width:36px;height:36px;border-radius:50%;border:3px solid rgba(255,255,255,0.1);border-top-color:#5aa8ff;animation:spin 0.8s linear infinite;}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        /* Workspace */
+        .sg-workspace{padding:24px;display:flex;flex-direction:column;gap:18px;}
+        .sg-wsHeader{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+        .sg-wsEyebrow{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.45);}
+        .sg-wsTitle{font-size:20px;font-weight:950;letter-spacing:-0.02em;color:rgba(255,255,255,0.94);margin-top:4px;}
+        .sg-headerActions{display:flex;gap:8px;flex-shrink:0;}
+        .sg-actionBtn{height:34px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.8);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;}
+        .sg-actionBtn:hover{background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);}
+        .sg-backBtn{height:34px;padding:0 14px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.8);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;}
+        .sg-backBtn:hover{background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);}
+        /* Hero */
+        .sg-heroCard{display:flex;align-items:center;gap:16px;padding:18px 20px;border-radius:16px;border:1px solid rgba(95,227,255,0.15);background:rgba(95,227,255,0.04);}
+        .sg-heroIcon{font-size:32px;flex-shrink:0;}
+        .sg-heroTitle{font-size:15px;font-weight:900;color:rgba(255,255,255,0.92);}
+        .sg-heroSub{font-size:12px;color:rgba(255,255,255,0.55);margin-top:3px;}
+        /* Sections */
+        .sg-sections{display:flex;flex-direction:column;gap:10px;}
+        .sg-sectionCard{border-radius:16px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.02);overflow:hidden;transition:border-color 200ms;}
+        .sg-sectionCard.highlight{border-color:rgba(95,227,255,0.25);background:rgba(95,227,255,0.03);}
+        .sg-secHeader{display:flex;align-items:center;gap:12px;padding:14px 18px;cursor:pointer;user-select:none;}
+        .sg-secHeader:hover{background:rgba(255,255,255,0.02);}
+        .sg-secNum{font-size:11px;font-weight:900;color:rgba(95,227,255,0.6);min-width:24px;}
+        .sg-secHeading{flex:1;font-size:14px;font-weight:900;color:rgba(255,255,255,0.9);letter-spacing:-0.01em;}
+        .sg-secCount{font-size:10px;font-weight:700;color:rgba(255,255,255,0.4);white-space:nowrap;}
+        .sg-secChevron{font-size:10px;color:rgba(255,255,255,0.4);flex-shrink:0;}
+        .sg-bullets{margin:0 0 16px 0;padding:0 18px 0 54px;display:flex;flex-direction:column;gap:8px;list-style:none;}
+        .sg-bullet{font-size:13px;color:rgba(255,255,255,0.78);line-height:1.6;padding-left:18px;position:relative;}
+        .sg-bullet::before{content:"•";position:absolute;left:0;color:#5aa8ff;font-size:16px;line-height:1.3;}
+        /* Nav buttons */
+        .sg-navBtns{display:flex;gap:10px;justify-content:center;padding:4px 0 8px;}
+        .sg-ctrlBtn{height:38px;padding:0 18px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.82);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;white-space:nowrap;}
+        .sg-ctrlBtn:hover:not(:disabled){background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);transform:translateY(-1px);}
+        .sg-ctrlBtn:disabled{opacity:0.3;cursor:default;}
+        .sg-ctrlAccent{background:linear-gradient(90deg,rgba(90,168,255,0.9),rgba(95,227,255,0.9));color:rgba(0,0,0,0.85);border-color:transparent;}
+        @media(max-width:700px){.sg-root{grid-template-columns:1fr;}.sg-sidebar{display:none;}}
       `}</style>
     </>
   );

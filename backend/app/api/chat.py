@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Query
 from jose import JWTError, jwt
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -301,6 +301,47 @@ def _read_session_text(session_id: str) -> str:
     return content
 
 
+def _verify_session_owner(session_id: str, request: Request) -> None:
+    """Raise 403 if the requester does not own the session. Allows anonymous fallback."""
+    engine = _get_engine()
+    if engine is None:
+        return  # No DB — skip ownership check (dev/test without DB)
+
+    owner_user_id, owner_anon_id = _get_owner_ids(request)
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            select(
+                session_sources.c.owner_user_id,
+                session_sources.c.owner_anon_id,
+            ).where(session_sources.c.session_id == session_id)
+        ).mappings().first()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired.")
+
+    sess_owner_user = row.get("owner_user_id") or None
+    sess_owner_anon = row.get("owner_anon_id") or None
+
+    # Logged-in user: must match owner_user_id
+    if owner_user_id:
+        if sess_owner_user and sess_owner_user != owner_user_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this session.")
+        return
+
+    # Anonymous user: must match owner_anon_id AND session must not be owned by a real user.
+    # If the session has an owner_user_id, it was created by a logged-in user — a signed-out
+    # requester must not access it even if the anon cookie happens to match.
+    if owner_anon_id:
+        if sess_owner_user:
+            raise HTTPException(status_code=403, detail="Not authorized to access this session.")
+        if sess_owner_anon and sess_owner_anon != owner_anon_id:
+            raise HTTPException(status_code=403, detail="Not authorized to access this session.")
+        return
+
+    raise HTTPException(status_code=401, detail="No user or anonymous session found.")
+
+
 class ChatTurn(BaseModel):
     role: Literal["user", "ai"]
     content: str = Field(min_length=1, max_length=10_000)
@@ -411,7 +452,7 @@ def chat(req: ChatRequest, request: Request):
 
     input_messages.append({"role": "user", "content": req.message})
 
-    model_name = os.getenv("OPENAI_CHAT_MODEL", os.getenv("OPENAI_MODEL", "gpt-5-nano"))
+    model_name = os.getenv("OPENAI_CHAT_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
     resp = _get_client().chat.completions.create(
         model=model_name,
@@ -445,7 +486,11 @@ def chat(req: ChatRequest, request: Request):
 
 
 @router.get("/chat/threads")
-def list_threads(request: Request):
+def list_threads(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
     engine = _get_engine()
     if engine is None:
         raise HTTPException(status_code=500, detail="DATABASE_URL is not set; cannot persist chats to the database.")
@@ -465,9 +510,15 @@ def list_threads(request: Request):
         if owner_user_id:
             q = q.where(conversations.c.owner_user_id == owner_user_id)
         else:
-            q = q.where(conversations.c.owner_anon_id == owner_anon_id)
+            # Restrict to truly anonymous conversations: anon_id matches AND no real user
+            # owns the conversation. This prevents logged-in-user threads from leaking
+            # back into the anonymous view after sign-out.
+            q = q.where(
+                (conversations.c.owner_anon_id == owner_anon_id) &
+                conversations.c.owner_user_id.is_(None)
+            )
 
-        q = q.order_by(conversations.c.updated_at.desc())
+        q = q.order_by(conversations.c.updated_at.desc()).limit(limit).offset(offset)
         rows = conn.execute(q).all()
 
     return {
@@ -512,6 +563,10 @@ def get_thread(thread_id: str, request: Request):
             if convo["owner_user_id"] != owner_user_id:
                 raise HTTPException(status_code=403, detail="Not allowed.")
         else:
+            # Anonymous path: deny if the thread belongs to a real user account,
+            # even if the anon cookie happens to match (post-logout leak prevention).
+            if convo["owner_user_id"] is not None:
+                raise HTTPException(status_code=403, detail="Not allowed.")
             if not owner_anon_id or convo["owner_anon_id"] != owner_anon_id:
                 raise HTTPException(status_code=403, detail="Not allowed.")
 

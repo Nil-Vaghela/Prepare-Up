@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { createPortal } from "react-dom";
 import * as THREE from "three";
 
@@ -36,6 +37,8 @@ type UploadedFile = {
 type OutputType = "podcast" | "study_guide" | "narrative" | "flash_card";
 type ChatRole = "user" | "ai";
 
+type PodcastTurn = { speaker: string; text: string };
+
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -43,6 +46,15 @@ type ChatMessage = {
   meta?: string;
   text: string;
   loading?: boolean;
+  // Rich output fields
+  outputType?: OutputType;
+  // podcast
+  podcastSpeakers?: [string, string];
+  podcastScript?: PodcastTurn[];
+  audioUrl?: string;
+  audioLoading?: boolean;
+  // flashcards
+  flashCards?: Array<{ front: string; back: string }>;
 };
 
 type ChatSession = {
@@ -66,20 +78,7 @@ type UserProfile = {
   avatar_url?: string | null;
 };
 
-type GoogleAccounts = {
-  id?: {
-    initialize?: (opts: { client_id: string; callback: (res: { credential?: string }) => void }) => void;
-    renderButton?: (el: HTMLElement, opts: Record<string, unknown>) => void;
-    prompt?: () => void;
-    disableAutoSelect?: () => void;
-  };
-};
-
-declare global {
-  interface Window {
-    google?: { accounts?: GoogleAccounts };
-  }
-}
+// window.google type is declared in lib/auth-context.tsx
 
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
@@ -95,51 +94,71 @@ function isAllowed(file: File) {
 }
 
 export default function DashboardPage() {
-  // Sidebar is NOT a router. It only offers generation modes.
+  const router = useRouter();
+
   // Helper to build Authorization headers if accessToken exists
-  const authHeaders = () => {
+  const authHeaders = (token?: string | null) => {
+    const t = token !== undefined ? token : accessToken;
     const h: Record<string, string> = {};
-    if (accessToken) h.Authorization = `Bearer ${accessToken}`;
+    if (t) h.Authorization = `Bearer ${t}`;
     return h;
+  };
+
+  // Silently refresh the access token from the HttpOnly refresh cookie.
+  // Promise-lock ensures concurrent 401s only trigger ONE refresh, not many.
+  const _refreshLockRef = useRef<Promise<string | null> | null>(null);
+  const silentRefresh = async (): Promise<string | null> => {
+    if (_refreshLockRef.current) return _refreshLockRef.current;
+    const p = (async () => {
+      try {
+        const res = await fetch(`${BACKEND_BASE}/api/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const newToken = typeof data?.access_token === "string" ? data.access_token : null;
+        if (newToken) setAccessToken(newToken);
+        return newToken;
+      } catch {
+        return null;
+      } finally {
+        _refreshLockRef.current = null;
+      }
+    })();
+    _refreshLockRef.current = p;
+    return p;
+  };
+
+  // Authenticated fetch that auto-refreshes on 401.
+  const authFetch = async (url: string, init: RequestInit = {}): Promise<Response> => {
+    const hdrs = new Headers(init.headers as HeadersInit);
+    if (accessToken) hdrs.set("Authorization", `Bearer ${accessToken}`);
+
+    const res = await fetch(url, { ...init, headers: hdrs, credentials: "include" });
+
+    if (res.status === 401) {
+      // Token may be expired — try a silent refresh and retry once
+      const newToken = await silentRefresh();
+      if (newToken) {
+        hdrs.set("Authorization", `Bearer ${newToken}`);
+        return fetch(url, { ...init, headers: hdrs, credentials: "include" });
+      }
+    }
+
+    return res;
   };
   const [sidebarActive, setSidebarActive] = useState<"flash_cards" | "podcast" | "mock_test" | "study_guide" | null>(
     null
   );
 
   const onSidebarSelect = (key: "flash_cards" | "podcast" | "mock_test" | "study_guide") => {
-    // Do NOT let users pick a mode before they have uploaded.
-    // Otherwise we accidentally create empty threads like "New chat".
-    if (!sessionId && uploaded.length === 0) {
-      // Sprint 1: sidebar items are non-functional until upload exists
-      return;
-    }
-
-    // Keep user on the single chat surface.
-    if (view !== "chat") setView("chat");
-
-    // Sprint 1: do not visually activate sidebar items
-    // setSidebarActive(key);
-
-    if (key === "flash_cards") {
-      void onSelectOutput("flash_card");
-      return;
-    }
-
-    if (key === "podcast") {
-      void onSelectOutput("podcast");
-      return;
-    }
-
-    if (key === "study_guide") {
-      void onSelectOutput("study_guide");
-      return;
-    }
-
-    // mock_test not implemented yet
-    if (key === "mock_test") {
-      // Sprint 1: no-op
-      return;
-    }
+    setSidebarActive(key);
+    // Navigate to dedicated feature pages — they have their own chat-selection flow
+    if (key === "flash_cards") { router.push("/flashcard");  return; }
+    if (key === "podcast")     { router.push("/podcast");    return; }
+    if (key === "mock_test")   { router.push("/mockquiz");   return; }
+    if (key === "study_guide") { router.push("/studyguide"); return; }
   };
 
   // Background mount
@@ -226,6 +245,21 @@ export default function DashboardPage() {
 
   const effectiveSessionId = sessionId || activeSession?.backendSessionId || null;
   const canChatInCurrentThread = !!effectiveSessionId;
+
+  /** Store session context in sessionStorage then navigate to a feature page. */
+  const navigateToFeature = (route: string) => {
+    try {
+      const sid = effectiveSessionId || sessionId;
+      if (sid) sessionStorage.setItem("pu_session_id", sid);
+      if (uploaded.length > 0) {
+        sessionStorage.setItem(
+          "pu_session_files",
+          JSON.stringify(uploaded.map((f) => ({ name: f.name })))
+        );
+      }
+    } catch { /* sessionStorage not available */ }
+    router.push(route);
+  };
 
   const extractErrorText = (raw: string) => {
     const text = (raw || "").trim();
@@ -445,10 +479,9 @@ export default function DashboardPage() {
       (opts?.forceTitle ?? (uploaded?.[0]?.name ? uploaded[0].name : "Chat")) || "Chat";
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/chat/sync`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/chat/sync`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           thread_id: threadId,
@@ -587,7 +620,6 @@ export default function DashboardPage() {
     });
   };
 
-  const canContinue = files.length > 0 && !uploading;
   const composerPlaceholder = sourceExpired
     ? "Source expired — re-upload files to continue..."
     : canChatInCurrentThread
@@ -850,8 +882,8 @@ export default function DashboardPage() {
 
     idApi.initialize({
       client_id: GOOGLE_CLIENT_ID,
-      callback: (res: { credential: string; }) => {
-        const cred = res?.credential || "";
+      callback: (res: { credential?: string }) => {
+        const cred = res?.credential ?? "";
         void completeLogin(cred);
       },
     });
@@ -913,13 +945,15 @@ export default function DashboardPage() {
 
   // Leak-proof: do not persist chat threads to localStorage
 
-  const loadThreadsFromBackend = async () => {
+  const loadThreadsFromBackend = async (explicitToken?: string | null) => {
+    const effectiveToken = explicitToken !== undefined ? explicitToken : accessToken;
+    const hdrs: Record<string, string> = {};
+    if (effectiveToken) hdrs.Authorization = `Bearer ${effectiveToken}`;
+
     try {
       const res = await fetch(`${BACKEND_BASE}/api/chat/threads`, {
         credentials: "include",
-        headers: {
-          ...authHeaders(),
-        },
+        headers: hdrs,
       });
 
       if (!res.ok) {
@@ -963,9 +997,38 @@ export default function DashboardPage() {
   };
 
   useEffect(() => {
-    // Leak-proof: do not hydrate chat sessions from localStorage.
-    // Chat history must come from the backend database.
-    void loadThreadsFromBackend();
+    // On mount: restore auth session (refresh cookie → access token), then load threads.
+    // This ensures logged-in users see their account threads after a page reload.
+    const initSession = async () => {
+      let restoredToken: string | null = null;
+      try {
+        const refreshRes = await fetch(`${BACKEND_BASE}/api/auth/refresh`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (refreshRes.ok) {
+          const refreshData = await refreshRes.json();
+          restoredToken = typeof refreshData?.access_token === "string" ? refreshData.access_token : null;
+          const rawUser = refreshData?.user || refreshData?.profile;
+          if (restoredToken) setAccessToken(restoredToken);
+          if (rawUser) {
+            setUserProfile({
+              id: typeof rawUser.id === "string" ? rawUser.id : null,
+              name: typeof rawUser.display_name === "string"
+                ? rawUser.display_name
+                : typeof rawUser.name === "string" ? rawUser.name : null,
+              email: typeof rawUser.email === "string" ? rawUser.email : null,
+              avatar_url: typeof rawUser.avatar_url === "string" ? rawUser.avatar_url : null,
+            });
+          }
+        }
+      } catch { /* backend not ready or not logged in */ }
+
+      // Pass the restored token directly so the fetch uses it (state may not have propagated yet)
+      await loadThreadsFromBackend(restoredToken);
+    };
+
+    void initSession();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -990,6 +1053,9 @@ export default function DashboardPage() {
       setAccessToken(null);
       setAuthMenuOpen(false);
       setAuthLoading(false);
+      // Clear thread list immediately so logged-in threads don't flash on screen
+      // while the re-fetch (anon-only) is in flight.
+      setChatSessions([]);
       void refreshMe({ allowFail: true });
       void loadThreadsFromBackend();
     }
@@ -1013,8 +1079,11 @@ export default function DashboardPage() {
   const [discordGuildsLoading, setDiscordGuildsLoading] = useState(false);
   const [discordInstallOpen, setDiscordInstallOpen] = useState(false);
   const [discordInstallError, setDiscordInstallError] = useState<string>("");
+  // Per-guild request state: maps guild_id → { message, invite_url, loading }
   const [discordRequestMessage, setDiscordRequestMessage] = useState<string>("");
   const [discordRequestInvite, setDiscordRequestInvite] = useState<string>("");
+  const [discordRequestGuildId, setDiscordRequestGuildId] = useState<string>("");
+  const [discordRequestLoading, setDiscordRequestLoading] = useState<string>(""); // guild_id of loading guild
   const [discordChannels, setDiscordChannels] = useState<DiscordChannel[]>([]);
   const [discordChannelsLoading, setDiscordChannelsLoading] = useState(false);
   const [selectedDiscordGuildId, setSelectedDiscordGuildId] = useState<string>("");
@@ -1043,39 +1112,44 @@ export default function DashboardPage() {
     }
   };
 
-const fetchDiscordChannels = async (guildId: string) => {
-  setDiscordChannelsLoading(true);
-  try {
-    const res = await fetch(`${BACKEND_BASE}/api/discord/bot/guilds/${guildId}/channels`, {
-      credentials: "include",
-      headers: { ...authHeaders() },
-    });
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(msg || "Failed to load Discord channels");
+  const fetchDiscordChannels = async (guildId: string) => {
+    setDiscordChannelsLoading(true);
+    try {
+      const res = await fetch(`${BACKEND_BASE}/api/discord/bot/guilds/${guildId}/channels`, {
+        credentials: "include",
+        headers: { ...authHeaders() },
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "Failed to load Discord channels");
+      }
+      const data = await res.json();
+      const chans: DiscordChannel[] = Array.isArray(data?.channels) ? data.channels : [];
+      setDiscordChannels(chans);
+      setSelectedDiscordGuildId(guildId);
+      // Do NOT auto-select a channel — user must pick one explicitly
+      setSelectedDiscordChannelId("");
+    } catch {
+      setDiscordChannels([]);
+      setSelectedDiscordGuildId(guildId);
+      setSelectedDiscordChannelId("");
+    } finally {
+      setDiscordChannelsLoading(false);
     }
-    const data = await res.json();
-    const chans: DiscordChannel[] = Array.isArray(data?.channels) ? data.channels : [];
-    setDiscordChannels(chans);
-    setSelectedDiscordGuildId(guildId);
-    setSelectedDiscordChannelId((prev) => (prev && chans.some((c) => c.id === prev) ? prev : chans[0]?.id || ""));
-  } catch {
-    setDiscordChannels([]);
-    setSelectedDiscordGuildId(guildId);
-    setSelectedDiscordChannelId("");
-  } finally {
-    setDiscordChannelsLoading(false);
-  }
-};
+  };
 
   const openDiscordInstall = async () => {
-    setDiscordInstallOpen(true);
+    // Reset request panel state when refreshing guild list
     setDiscordRequestMessage("");
     setDiscordRequestInvite("");
+    setDiscordRequestGuildId("");
+    setDiscordRequestLoading("");
     await fetchDiscordGuilds();
   };
 
   const prepareDiscordSourceInBackground = async () => {
+    // Populate the guild list so the server picker is ready.
+    // Do NOT auto-select a guild or channel — the user must pick explicitly.
     try {
       const res = await fetch(`${BACKEND_BASE}/api/discord/guilds`, {
         credentials: "include",
@@ -1086,23 +1160,17 @@ const fetchDiscordChannels = async (guildId: string) => {
       const data = await res.json();
       const guilds: DiscordGuild[] = Array.isArray(data?.guilds) ? data.guilds : [];
       setDiscordGuilds(guilds);
-
-      const installedGuilds = guilds.filter((g) => g.installed);
-      if (installedGuilds.length > 0) {
-        await fetchDiscordChannels(installedGuilds[0].id);
-      } else {
-        setDiscordChannels([]);
-        setSelectedDiscordGuildId("");
-        setSelectedDiscordChannelId("");
-      }
+      // Reset any stale selection so Step 2 (server picker) is shown
+      setSelectedDiscordGuildId((prev) => (guilds.some((g) => g.id === prev) ? prev : ""));
+      setSelectedDiscordChannelId("");
+      setDiscordChannels([]);
     } catch {
       // ignore background discovery failures on upload screen
     }
   };
 
   const refreshDiscordInstallState = async () => {
-  await fetchDiscordGuilds();
-  await prepareDiscordSourceInBackground();
+    await fetchDiscordGuilds();
   };
 
   const installBot = async () => {
@@ -1143,8 +1211,18 @@ const fetchDiscordChannels = async (guildId: string) => {
   };
 
   const requestAdminInstall = async (g: DiscordGuild) => {
+    // If already showing this guild's panel, toggle it off
+    if (discordRequestGuildId === g.id && discordRequestMessage) {
+      setDiscordRequestGuildId("");
+      setDiscordRequestMessage("");
+      setDiscordRequestInvite("");
+      return;
+    }
+
     setDiscordRequestMessage("");
     setDiscordRequestInvite("");
+    setDiscordRequestGuildId(g.id);
+    setDiscordRequestLoading(g.id);
     setDiscordInstallError("");
     try {
       const qs = new URLSearchParams({ guild_id: g.id, guild_name: g.name });
@@ -1164,10 +1242,13 @@ const fetchDiscordChannels = async (guildId: string) => {
       try {
         if (data?.message) await navigator.clipboard.writeText(data.message);
       } catch {
-        // ignore
+        // ignore clipboard access
       }
     } catch (e: any) {
-      setDiscordInstallError(e?.message || "Failed to generate admin request message");
+      setDiscordInstallError(e?.message || "Failed to generate request message");
+      setDiscordRequestGuildId("");
+    } finally {
+      setDiscordRequestLoading("");
     }
   };
 
@@ -1190,10 +1271,32 @@ const fetchDiscordChannels = async (guildId: string) => {
   }, [discordGuilds]);
 
   useEffect(() => {
-  if (discordState !== "connected") return;
-  void prepareDiscordSourceInBackground();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (discordState !== "connected") return;
+    void prepareDiscordSourceInBackground();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [discordState]);
+
+  // On mount: check if user already has a Discord session (persists across page reloads)
+  useEffect(() => {
+    const checkDiscordStatus = async () => {
+      try {
+        const res = await fetch(`${BACKEND_BASE}/api/discord/status`, {
+          credentials: "include",
+          headers: { ...authHeaders() },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data?.connected === true) {
+          setDiscordState("connected");
+          setDiscordError("");
+        }
+      } catch {
+        // ignore — backend may not be ready yet
+      }
+    };
+    void checkDiscordStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Read the redirect result from the URL once (prevents repeated token exchange loops)
   useEffect(() => {
@@ -1721,15 +1824,9 @@ const uploadToBackend = async () => {
     }
 
     if (hasDiscordSource && selectedDiscordGuild && selectedDiscordChannel) {
-      const importRes = await fetch(
+      const importRes = await authFetch(
         `${BACKEND_BASE}/api/discord/bot/channels/${selectedDiscordChannel.id}/import?max_messages=300`,
-        {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            ...authHeaders(),
-          },
-        }
+        { method: "POST" }
       );
 
       if (!importRes.ok) {
@@ -1756,13 +1853,9 @@ const uploadToBackend = async () => {
       }
     }
 
-    const res = await fetch(`${BACKEND_BASE}/api/upload`, {
+    const res = await authFetch(`${BACKEND_BASE}/api/upload`, {
       method: "POST",
       body: form,
-      credentials: "include",
-      headers: {
-        ...authHeaders(),
-      },
     });
 
     if (!res.ok) {
@@ -1954,10 +2047,9 @@ const uploadToBackend = async () => {
     });
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/generate`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/generate`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           output_type: k,
@@ -1974,28 +2066,71 @@ const uploadToBackend = async () => {
       }
 
       const data = await res.json();
-      const answer =
-        typeof data.text === "string"
-          ? data.text
-          : Array.isArray(data.cards)
-          ? data.cards
-              .map((c: any, i: number) => {
-                const front = typeof c?.front === "string" ? c.front : "";
-                const back = typeof c?.back === "string" ? c.back : "";
-                return `${i + 1}. ${front}\n   - ${back}`;
-              })
-              .join("\n\n")
-          : typeof data.response === "string"
-          ? data.response
-          : JSON.stringify(data);
+
+      // Build the AI message with structured data for rich rendering
+      let richFields: Partial<ChatMessage> = { loading: false };
+
+      if (k === "podcast" && Array.isArray(data.script)) {
+        richFields = {
+          ...richFields,
+          outputType: "podcast",
+          podcastSpeakers: Array.isArray(data.speakers) ? [data.speakers[0] ?? "Host", data.speakers[1] ?? "Guest"] : ["Host", "Guest"],
+          podcastScript: data.script as PodcastTurn[],
+          text: "", // text unused — rendered from script
+          audioLoading: true,
+        };
+      } else if (k === "flash_card" && Array.isArray(data.cards)) {
+        richFields = {
+          ...richFields,
+          outputType: "flash_card",
+          flashCards: data.cards as Array<{ front: string; back: string }>,
+          text: "",
+        };
+      } else if (typeof data.text === "string") {
+        richFields = { ...richFields, text: data.text };
+      } else if (typeof data.response === "string") {
+        richFields = { ...richFields, text: data.response };
+      } else {
+        richFields = { ...richFields, text: "Done." };
+      }
 
       const nextMessages = messages
         .concat([userMsg, aiLoading])
-        .map((m) => (m.id === aiLoadingId ? { ...m, text: answer, loading: false } : m));
+        .map((m) => (m.id === aiLoadingId ? { ...m, ...richFields } : m));
 
       setMessages(nextMessages);
       upsertActiveSession({ messages: nextMessages });
       void persistThreadSnapshot({ forceMessages: nextMessages });
+
+      // Auto-fetch podcast audio in background after script arrives
+      if (k === "podcast" && Array.isArray(data.script)) {
+        const script = data.script as PodcastTurn[];
+        const speakers: [string, string] = [data.speakers?.[0] ?? "Host", data.speakers?.[1] ?? "Guest"];
+        void (async () => {
+          try {
+            const audioRes = await fetch(`${BACKEND_BASE}/api/podcast/audio`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...authHeaders() },
+              credentials: "include",
+              body: JSON.stringify({ speakers, script }),
+            });
+            if (!audioRes.ok) throw new Error("Audio generation failed");
+            const blob = await audioRes.blob();
+            const url = URL.createObjectURL(blob);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiLoadingId ? { ...m, audioUrl: url, audioLoading: false } : m
+              )
+            );
+          } catch {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === aiLoadingId ? { ...m, audioLoading: false } : m
+              )
+            );
+          }
+        })();
+      }
     } catch (e: any) {
       const nextMessages = messages
         .concat([userMsg, aiLoading])
@@ -2042,10 +2177,9 @@ const uploadToBackend = async () => {
     });
 
     try {
-      const res = await fetch(`${BACKEND_BASE}/api/chat`, {
+      const res = await authFetch(`${BACKEND_BASE}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        credentials: "include",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           session_id: resolvedSessionId,
           thread_id: activeChatIdRef.current,
@@ -2663,6 +2797,151 @@ const uploadToBackend = async () => {
           box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 0 16px rgba(95, 227, 255, 0.18);
         }
 
+        /* ── Discord inline flow ── */
+        .pu-discordStep {
+          padding: 14px 16px 16px;
+          border-top: 1px solid rgba(255,255,255,0.06);
+          max-height: 340px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.15) transparent;
+        }
+        .pu-discordStep::-webkit-scrollbar { width: 4px; }
+        .pu-discordStep::-webkit-scrollbar-track { background: transparent; }
+        .pu-discordStep::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+        .pu-discordStepLabel {
+          font-size: 10px;
+          font-weight: 900;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: rgba(255,255,255,0.4);
+          margin-bottom: 10px;
+        }
+        .pu-discordLoading {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          font-size: 12px;
+          color: rgba(255,255,255,0.6);
+          padding: 4px 0;
+        }
+        .pu-discordSpinner {
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          border: 2px solid rgba(255,255,255,0.1);
+          border-top-color: #5aa8ff;
+          animation: spin 0.7s linear infinite;
+          flex-shrink: 0;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .pu-discordEmpty {
+          font-size: 12px;
+          color: rgba(255,255,255,0.5);
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 8px;
+        }
+        .pu-discordGuilds {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .pu-discordGuild:hover { border-color: rgba(255,255,255,0.16); background: rgba(255,255,255,0.04); }
+        .pu-discordGuild {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 10px 14px;
+          border-radius: 14px;
+          border: 1px solid rgba(255,255,255,0.08);
+          background: rgba(255,255,255,0.02);
+          transition: border-color 130ms, background 130ms;
+        }
+        .pu-discordGuild.ready {
+          border-color: rgba(95,227,100,0.18);
+          background: rgba(95,227,100,0.04);
+        }
+        .pu-discordGuildLeft { min-width: 0; flex: 1; }
+        .pu-discordGuildName {
+          font-size: 12px;
+          font-weight: 800;
+          color: rgba(255,255,255,0.9);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .pu-discordGuildStatus {
+          font-size: 11px;
+          color: rgba(255,255,255,0.5);
+          margin-top: 2px;
+        }
+        .pu-discordGuild.ready .pu-discordGuildStatus { color: rgba(95,227,100,0.8); }
+        .pu-discordChannels {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          max-height: 180px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.15) transparent;
+        }
+        .pu-discordChannels::-webkit-scrollbar { width: 4px; }
+        .pu-discordChannels::-webkit-scrollbar-track { background: transparent; }
+        .pu-discordChannels::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+        .pu-discordChan {
+          height: 30px;
+          padding: 0 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: rgba(255,255,255,0.03);
+          color: rgba(255,255,255,0.78);
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: all 130ms;
+          white-space: nowrap;
+        }
+        .pu-discordChan:hover { background: rgba(255,255,255,0.07); border-color: rgba(95,227,255,0.25); }
+        .pu-discordChan.active {
+          background: rgba(95,227,255,0.12);
+          border-color: rgba(95,227,255,0.4);
+          color: #5fe3ff;
+        }
+        .pu-discordGuild.pu-discordGuildActive {
+          border-color: rgba(95,227,255,0.25);
+          background: rgba(95,227,255,0.05);
+        }
+        .pu-btnActive {
+          background: rgba(95,227,100,0.12) !important;
+          border-color: rgba(95,227,100,0.35) !important;
+          color: rgba(95,227,100,0.9) !important;
+        }
+        .pu-discordRequest { margin-top: 0; padding: 10px 14px 12px; background: rgba(95,227,255,0.04); border: 1px solid rgba(95,227,255,0.14); border-top: none; border-radius: 0 0 14px 14px; }
+        .pu-discordRequestPreview {
+          font-size: 11px;
+          color: rgba(255,255,255,0.55);
+          background: rgba(0,0,0,0.25);
+          border: 1px solid rgba(255,255,255,0.07);
+          border-radius: 8px;
+          padding: 8px 10px;
+          margin: 8px 0;
+          white-space: pre-wrap;
+          max-height: 80px;
+          overflow-y: auto;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.1) transparent;
+          line-height: 1.5;
+        }
+        .pu-discordRequestLabel {
+          font-size: 11px;
+          color: rgba(255,255,255,0.6);
+          margin-bottom: 8px;
+        }
+        .pu-discordRequestBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+
         .pu-fileList {
           margin-top: 14px;
           display: flex;
@@ -3082,152 +3361,6 @@ const uploadToBackend = async () => {
 
         {/* Main */}
         <main className="pu-glass pu-main">
-          {discordInstallOpen ? (
-            <div
-              role="dialog"
-              aria-modal="true"
-              style={{
-                position: "fixed",
-                inset: 0,
-                zIndex: 50,
-                background: "rgba(0,0,0,0.55)",
-                display: "grid",
-                placeItems: "center",
-                padding: 16,
-              }}
-              onMouseDown={(e) => {
-                if (e.target === e.currentTarget) setDiscordInstallOpen(false);
-              }}
-            >
-              <div
-                className="pu-glass"
-                style={{
-                  width: "min(820px, 100%)",
-                  maxHeight: "min(80vh, 720px)",
-                  overflow: "auto",
-                  padding: 16,
-                }}
-              >
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                  <div style={{ fontWeight: 950, fontSize: 14 }}>Add PrepareUp Bot</div>
-                  <button className="pu-btn" type="button" onClick={() => setDiscordInstallOpen(false)}>
-                    Close
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 8, fontSize: 12, color: "rgba(255,255,255,0.70)", lineHeight: 1.5 }}>
-                  Select a server. If you don’t have permission to install apps, we’ll generate a message you can send to an
-                  admin (auto-copied).
-                </div>
-
-                {discordInstallError ? (
-                  <div style={{ marginTop: 10, fontSize: 12, color: "rgba(255,120,120,0.95)" }}>{discordInstallError}</div>
-                ) : null}
-
-                <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                  <button
-                    className={`pu-btn ${discordGuildsLoading ? "pu-btnDisabled" : ""}`}
-                    type="button"
-                    onClick={() => void fetchDiscordGuilds()}
-                    disabled={discordGuildsLoading}
-                  >
-                    {discordGuildsLoading ? "Loading…" : "Refresh servers"}
-                  </button>
-
-                  <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
-                    Open install link
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-                  {sortedDiscordGuilds.map((g) => (
-                    <div
-                      key={g.id}
-                      style={{
-                        border: "1px solid rgba(255,255,255,0.10)",
-                        borderRadius: 16,
-                        padding: 12,
-                        background: "rgba(255,255,255,0.03)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: 12,
-                      }}
-                    >
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{ fontWeight: 950, fontSize: 12, color: "rgba(255,255,255,0.92)" }}>{g.name}</div>
-                        <div style={{ marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.62)" }}>
-                          {g.installed
-                            ? "Bot already installed"
-                            : g.can_manage
-                              ? "You can install apps here"
-                              : "Admin permission required"}
-                        </div>
-                      </div>
-
-                      {g.installed ? (
-                        <button className="pu-btn pu-btnDisabled" type="button" disabled title="Bot is already installed">
-                          Installed
-                        </button>
-                      ) : g.can_manage ? (
-                        <button className="pu-btn pu-btnPrimary" type="button" onClick={() => void installBot()}>
-                          Add bot
-                        </button>
-                      ) : (
-                        <button className="pu-btn" type="button" onClick={() => void requestAdminInstall(g)}>
-                          Request admin
-                        </button>
-                      )}
-                    </div>
-                  ))}
-
-                  {!discordGuildsLoading && sortedDiscordGuilds.length === 0 ? (
-                    <div style={{ fontSize: 12, color: "rgba(255,255,255,0.62)", padding: 10 }}>
-                      No servers found. Make sure you authorized the correct Discord account.
-                    </div>
-                  ) : null}
-                </div>
-
-                {discordRequestMessage ? (
-                  <div style={{ marginTop: 16 }}>
-                    <div style={{ fontWeight: 950, fontSize: 12 }}>Message to send to an admin</div>
-                    <div style={{ marginTop: 8, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                      <button className="pu-btn" type="button" onClick={() => void copyRequestMessage()}>
-                        Copy message
-                      </button>
-                      {discordRequestInvite ? (
-                        <button
-                          className="pu-btn"
-                          type="button"
-                          onClick={() => window.open(discordRequestInvite, "_blank", "noopener,noreferrer")}
-                        >
-                          Open invite link
-                        </button>
-                      ) : null}
-                    </div>
-                    <textarea
-                      value={discordRequestMessage}
-                      readOnly
-                      style={{
-                        marginTop: 10,
-                        width: "100%",
-                        minHeight: 140,
-                        borderRadius: 14,
-                        border: "1px solid rgba(255,255,255,0.12)",
-                        background: "rgba(10,12,18,0.35)",
-                        color: "rgba(255,255,255,0.90)",
-                        padding: 12,
-                        outline: "none",
-                        resize: "vertical",
-                        fontSize: 12,
-                        lineHeight: 1.45,
-                      }}
-                    />
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
           <div className="pu-topbar">
           <div />
 
@@ -3393,56 +3526,195 @@ const uploadToBackend = async () => {
                     </div>
                   </div>
 
-                  {/* Discord integration */}
+                  {/* ── Discord inline integration ── */}
                   <div className="pu-drop pu-discord">
-                    <div className="pu-dropInner">
-                      <div>
+                    {/* Header row — always visible */}
+                    <div className="pu-dropInner" style={{ alignItems: "flex-start" }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
                         <div className="pu-dropTitle">
                           <span className={`pu-dot ${discordState === "connected" ? "ok" : "idle"}`} />
                           Discord
+                          {discordState === "connected" && selectedDiscordGuild && selectedDiscordChannel && (
+                            <span style={{ fontWeight: 700, fontSize: 11, color: "rgba(95,227,100,0.9)", marginLeft: 8 }}>
+                              {selectedDiscordGuild.name} · #{selectedDiscordChannel.name}
+                            </span>
+                          )}
                         </div>
-
                         <div className="pu-dropSub">
-                          {discordState === "connected"
-                            ? discordChannelsLoading
-                              ? "Discord connected. Scanning installed servers and channels in the background…"
-                              : selectedDiscordGuild && selectedDiscordChannel
-                                ? `Discord connected. Ready from ${selectedDiscordGuild.name} • #${selectedDiscordChannel.name}.`
-                                : "Discord connected. Next: add the bot to a server (if you haven't yet)."
-                            : "Connect Discord to pull your server data in the background."}
+                          {discordState === "idle" || discordState === "error"
+                            ? "Connect Discord to import server messages as study material."
+                            : discordState === "connecting"
+                              ? "Redirecting to Discord…"
+                              : hasDiscordSource
+                                ? "Ready — messages will be imported when you click Continue."
+                                : discordGuildsLoading
+                                  ? "Loading your servers…"
+                                  : selectedDiscordGuildId && !selectedDiscordChannelId
+                                    ? `${selectedDiscordGuild?.name} — pick a channel below.`
+                                    : discordGuilds.length > 0
+                                      ? "Pick a server, then a channel to import from."
+                                      : "Connected — click Load Servers to choose what to import."}
                         </div>
-
-                        {discordState === "error" && discordError ? (
-                          <div className="pu-dropSub" style={{ marginTop: 8, color: "rgba(255,255,255,0.78)" }}>
-                            ⚠️ {discordError}
-                          </div>
-                        ) : null}
+                        {discordState === "error" && discordError && (
+                          <div className="pu-dropSub" style={{ marginTop: 6, color: "rgba(255,120,120,0.9)" }}>⚠️ {discordError}</div>
+                        )}
+                        {discordInstallError && discordState === "connected" && (
+                          <div className="pu-dropSub" style={{ marginTop: 6, color: "rgba(255,120,120,0.9)" }}>⚠️ {discordInstallError}</div>
+                        )}
                       </div>
 
-                      <div className="pu-btnRow">
-                        <button
-                          className={`pu-btn ${discordState === "connecting" ? "pu-btnDisabled" : ""}`}
-                          onClick={onConnectDiscord}
-                          type="button"
-                          disabled={discordState === "connecting"}
-                          suppressHydrationWarning
-                        >
-                          <LinkIcon />
-                          {discordState === "connected" ? "Reconnect" : discordState === "connecting" ? "Connecting…" : "Connect"}
-                        </button>
-
-                        <button
-                          className={`pu-btn ${discordState === "connected" ? "" : "pu-btnDisabled"}`}
-                          type="button"
-                          onClick={onInviteBot}
-                          disabled={discordState !== "connected"}
-                          title={discordState === "connected" ? "" : "Connect Discord first"}
-                        >
-                          <DownloadIcon />
-                          Add Bot
-                        </button>
+                      <div className="pu-btnRow" style={{ flexShrink: 0 }}>
+                        {discordState !== "connected" ? (
+                          <button
+                            className={`pu-btn ${discordState === "connecting" ? "pu-btnDisabled" : ""}`}
+                            onClick={onConnectDiscord}
+                            type="button"
+                            disabled={discordState === "connecting"}
+                            suppressHydrationWarning
+                          >
+                            <LinkIcon />
+                            {discordState === "connecting" ? "Connecting…" : "Connect"}
+                          </button>
+                        ) : hasDiscordSource ? (
+                          <button className="pu-btn" type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setSelectedDiscordChannelId(""); setDiscordChannels([]); }}>
+                            Change
+                          </button>
+                        ) : selectedDiscordGuildId ? (
+                          // Step 3 active — back to server list
+                          <button className="pu-btn" type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setDiscordChannels([]); }}>
+                            ← Servers
+                          </button>
+                        ) : (
+                          // Disconnected or guilds not loaded — load servers
+                          <button className="pu-btn" type="button"
+                            onClick={() => void fetchDiscordGuilds()}
+                            disabled={discordGuildsLoading}
+                            suppressHydrationWarning>
+                            {discordGuildsLoading ? "Loading…" : discordGuilds.length > 0 ? "Reload" : "Load Servers"}
+                          </button>
+                        )}
                       </div>
                     </div>
+
+                    {/* Step 2: server list */}
+                    {discordState === "connected" && !selectedDiscordGuildId && (
+                      <div className="pu-discordStep">
+                        {discordGuildsLoading ? (
+                          <div className="pu-discordLoading">
+                            <div className="pu-discordSpinner" />
+                            <span>Loading servers…</span>
+                          </div>
+                        ) : sortedDiscordGuilds.length === 0 ? (
+                          <div className="pu-discordEmpty">
+                            No Discord servers found. Make sure you authorized the right account.
+                            <button className="pu-btn" style={{ marginTop: 8 }} onClick={() => void fetchDiscordGuilds()}>Retry</button>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="pu-discordStepLabel">SELECT A SERVER</div>
+                            <div className="pu-discordGuilds">
+                              {sortedDiscordGuilds.map((g) => (
+                                <div key={g.id}>
+                                  <div className={`pu-discordGuild${g.installed ? " ready" : ""}${discordRequestGuildId === g.id ? " pu-discordGuildActive" : ""}`}>
+                                    <div className="pu-discordGuildLeft">
+                                      <div className="pu-discordGuildName">{g.name}</div>
+                                      <div className="pu-discordGuildStatus">
+                                        {g.installed ? "✓ Bot ready" : g.can_manage ? "Add bot to use" : "Needs admin"}
+                                      </div>
+                                    </div>
+                                    {g.installed ? (
+                                      <button className="pu-btn pu-btnPrimary" type="button"
+                                        onClick={() => void fetchDiscordChannels(g.id)}>
+                                        Select →
+                                      </button>
+                                    ) : g.can_manage ? (
+                                      <button className="pu-btn" type="button" onClick={() => void installBot()}>
+                                        Add Bot
+                                      </button>
+                                    ) : (
+                                      <button
+                                        className={`pu-btn${discordRequestGuildId === g.id && discordRequestMessage ? " pu-btnActive" : ""}`}
+                                        type="button"
+                                        disabled={discordRequestLoading === g.id}
+                                        onClick={() => void requestAdminInstall(g)}
+                                      >
+                                        {discordRequestLoading === g.id ? "…" : discordRequestGuildId === g.id && discordRequestMessage ? "✓ Copied" : "Request"}
+                                      </button>
+                                    )}
+                                  </div>
+                                  {/* Inline request panel — shown right under this guild */}
+                                  {discordRequestGuildId === g.id && discordRequestMessage && (
+                                    <div className="pu-discordRequest">
+                                      <div className="pu-discordRequestLabel">
+                                        Message copied to clipboard! Send it to the admin of <strong>{g.name}</strong>:
+                                      </div>
+                                      <div className="pu-discordRequestPreview">
+                                        {discordRequestMessage}
+                                      </div>
+                                      <div className="pu-discordRequestBtns">
+                                        <button className="pu-btn" type="button" onClick={() => void copyRequestMessage()}>
+                                          Copy again
+                                        </button>
+                                        {discordRequestInvite && (
+                                          <button className="pu-btn" type="button"
+                                            onClick={() => window.open(discordRequestInvite, "_blank", "noopener,noreferrer")}>
+                                            Open invite link
+                                          </button>
+                                        )}
+                                        <button className="pu-btn" style={{ marginLeft: "auto" }} type="button"
+                                          onClick={() => { setDiscordRequestGuildId(""); setDiscordRequestMessage(""); setDiscordRequestInvite(""); }}>
+                                          Dismiss
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Step 3: channel list */}
+                    {discordState === "connected" && selectedDiscordGuildId && !selectedDiscordChannelId && (
+                      <div className="pu-discordStep">
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+                          <button className="pu-btn" style={{ height: 28, padding: "0 10px", fontSize: 11 }} type="button"
+                            onClick={() => { setSelectedDiscordGuildId(""); setDiscordChannels([]); }}>
+                            ← Back
+                          </button>
+                          <div className="pu-discordStepLabel" style={{ margin: 0 }}>
+                            {selectedDiscordGuild?.name} — PICK A CHANNEL
+                          </div>
+                        </div>
+                        {discordChannelsLoading ? (
+                          <div className="pu-discordLoading"><div className="pu-discordSpinner" /><span>Loading channels…</span></div>
+                        ) : discordChannels.length === 0 ? (
+                          <div className="pu-discordEmpty">No text channels found. Make sure the bot has read access.</div>
+                        ) : (
+                          <div className="pu-discordChannels">
+                            {discordChannels.map((c) => (
+                              <button
+                                key={c.id}
+                                className={`pu-discordChan${selectedDiscordChannelId === c.id ? " active" : ""}`}
+                                type="button"
+                                onClick={() => setSelectedDiscordChannelId(c.id)}
+                              >
+                                # {c.name}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        {selectedDiscordChannelId && !discordChannelsLoading && (
+                          <div style={{ marginTop: 10, fontSize: 12, color: "rgba(95,227,100,0.9)", fontWeight: 800 }}>
+                            ✓ #{discordChannels.find(c => c.id === selectedDiscordChannelId)?.name} selected — click Continue above to import.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className={`pu-drop${dragging ? " drag" : ""}`}>
@@ -3512,8 +3784,23 @@ const uploadToBackend = async () => {
                     <div key={m.id} className={`pu-msgRow ${m.role === "user" ? "right" : "left"}`}>
                       <div className={`pu-msgBubble ${m.role === "user" ? "user" : "ai"}`}>
                         {m.title ? <div className="pu-msgTitle">{m.title}</div> : null}
-                        {m.meta ? <div className="pu-msgMeta">{m.meta}</div> : null}
-                        <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
+                        {m.meta  ? <div className="pu-msgMeta">{m.meta}</div>  : null}
+
+                        {/* ── Podcast rich card ── */}
+                        {m.outputType === "podcast" && !m.loading ? (
+                          <PodcastCard
+                            speakers={m.podcastSpeakers ?? ["Host", "Guest"]}
+                            script={m.podcastScript ?? []}
+                            audioUrl={m.audioUrl ?? null}
+                            audioLoading={m.audioLoading ?? false}
+                          />
+                        ) : m.outputType === "flash_card" && !m.loading && Array.isArray(m.flashCards) ? (
+                          /* ── Flashcard rich card ── */
+                          <FlashCardDeck cards={m.flashCards} />
+                        ) : (
+                          /* ── Plain text (study guide, narrative, chat) ── */
+                          <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
+                        )}
                       </div>
                     </div>
                   ))}
@@ -3534,7 +3821,7 @@ const uploadToBackend = async () => {
                           Narrative
                         </button>
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("flash_card")} disabled={generating}>
-                          Flash Card
+                          Flash Cards
                         </button>
                       </div>
                     </div>
@@ -3593,6 +3880,223 @@ const uploadToBackend = async () => {
           </div>
         </main>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Podcast inline audio card
+// ─────────────────────────────────────────────
+function PodcastCard({
+  speakers,
+  script,
+  audioUrl,
+  audioLoading,
+}: {
+  speakers: [string, string];
+  script: PodcastTurn[];
+  audioUrl: string | null;
+  audioLoading: boolean;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [showScript, setShowScript] = useState(false);
+
+  const togglePlay = () => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (playing) { a.pause(); setPlaying(false); }
+    else { void a.play(); setPlaying(true); }
+  };
+
+  const fmt = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, "0")}`;
+  };
+
+  return (
+    <div className="pc-root">
+      {/* header */}
+      <div className="pc-header">
+        <div className="pc-icon">🎙</div>
+        <div>
+          <div className="pc-title">Podcast</div>
+          <div className="pc-sub">{speakers[0]} &amp; {speakers[1]} · {script.length} turns</div>
+        </div>
+      </div>
+
+      {/* audio player */}
+      {audioUrl ? (
+        <>
+          <audio
+            ref={audioRef}
+            src={audioUrl}
+            onTimeUpdate={(e) => setProgress((e.currentTarget.currentTime / (e.currentTarget.duration || 1)) * 100)}
+            onDurationChange={(e) => setDuration(e.currentTarget.duration)}
+            onEnded={() => setPlaying(false)}
+          />
+          <div className="pc-playerBar">
+            <button className="pc-playBtn" onClick={togglePlay} type="button">
+              {playing ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>
+              )}
+            </button>
+            <div className="pc-progressWrap">
+              <div className="pc-waveform">
+                {Array.from({ length: 32 }).map((_, i) => {
+                  const pct = progress / 100;
+                  const pos = i / 32;
+                  const h = 20 + Math.abs(Math.sin((i * 0.7) + 1.3) * Math.cos(i * 0.4) * 22);
+                  return (
+                    <div
+                      key={i}
+                      className="pc-bar"
+                      style={{
+                        height: `${h}px`,
+                        background: pos <= pct
+                          ? "linear-gradient(180deg,#5aa8ff,#5fe3ff)"
+                          : "rgba(255,255,255,0.15)",
+                      }}
+                    />
+                  );
+                })}
+              </div>
+              <input
+                type="range" min={0} max={100} step={0.1}
+                value={progress}
+                className="pc-seek"
+                onChange={(e) => {
+                  const a = audioRef.current;
+                  if (!a) return;
+                  const v = parseFloat(e.target.value);
+                  a.currentTime = (v / 100) * a.duration;
+                  setProgress(v);
+                }}
+              />
+            </div>
+            <div className="pc-time">{fmt((progress / 100) * duration)} / {fmt(duration)}</div>
+            <a href={audioUrl} download="podcast.mp3" className="pc-dl" title="Download MP3">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4"/><path d="M8 12l4 4 4-4"/><path d="M4 20h16"/></svg>
+            </a>
+          </div>
+        </>
+      ) : (
+        <div className="pc-audioLoading">
+          {audioLoading ? (
+            <><div className="pc-audioSpinner" /><span>Generating audio…</span></>
+          ) : (
+            <span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>Audio unavailable</span>
+          )}
+        </div>
+      )}
+
+      {/* transcript toggle */}
+      <button className="pc-scriptToggle" type="button" onClick={() => setShowScript((v) => !v)}>
+        {showScript ? "Hide transcript ↑" : "Show transcript ↓"}
+      </button>
+      {showScript && (
+        <div className="pc-script">
+          {script.map((turn, i) => (
+            <div key={i} className={`pc-turn ${turn.speaker === speakers[0] ? "host" : "guest"}`}>
+              <span className="pc-speaker">{turn.speaker}</span>
+              <span className="pc-turnText">{turn.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <style jsx>{`
+        .pc-root { display:flex; flex-direction:column; gap:10px; min-width:280px; max-width:520px; }
+        .pc-header { display:flex; align-items:center; gap:10px; }
+        .pc-icon { font-size:22px; line-height:1; }
+        .pc-title { font-size:14px; font-weight:950; color:rgba(255,255,255,0.94); letter-spacing:-0.01em; }
+        .pc-sub { font-size:11px; color:rgba(255,255,255,0.5); margin-top:2px; }
+        .pc-playerBar { display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,255,255,0.1); background:rgba(10,12,18,0.4); }
+        .pc-playBtn { width:32px; height:32px; border-radius:50%; border:1px solid rgba(255,255,255,0.15); background:linear-gradient(135deg,rgba(90,168,255,0.85),rgba(95,227,255,0.85)); color:rgba(0,0,0,0.85); display:grid; place-items:center; cursor:pointer; flex-shrink:0; transition:transform 120ms; }
+        .pc-playBtn:hover { transform:scale(1.06); }
+        .pc-progressWrap { flex:1; position:relative; height:36px; display:flex; align-items:center; }
+        .pc-waveform { position:absolute; inset:0; display:flex; align-items:center; gap:2px; pointer-events:none; overflow:hidden; }
+        .pc-bar { flex:1; border-radius:2px; min-height:3px; transition:background 200ms; }
+        .pc-seek { position:absolute; inset:0; width:100%; opacity:0; cursor:pointer; height:100%; }
+        .pc-time { font-size:11px; font-weight:700; color:rgba(255,255,255,0.55); white-space:nowrap; flex-shrink:0; }
+        .pc-dl { color:rgba(255,255,255,0.5); display:grid; place-items:center; flex-shrink:0; transition:color 140ms; }
+        .pc-dl:hover { color:rgba(95,227,255,0.9); }
+        .pc-audioLoading { display:flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px; border:1px solid rgba(255,255,255,0.08); background:rgba(10,12,18,0.3); font-size:12px; color:rgba(255,255,255,0.6); }
+        .pc-audioSpinner { width:14px; height:14px; border-radius:50%; border:2px solid rgba(255,255,255,0.15); border-top-color:#5aa8ff; animation:spin 0.8s linear infinite; flex-shrink:0; }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .pc-scriptToggle { align-self:flex-start; font-size:11px; font-weight:700; color:rgba(95,227,255,0.7); background:none; border:none; cursor:pointer; padding:0; letter-spacing:0.02em; }
+        .pc-scriptToggle:hover { color:rgba(95,227,255,1); }
+        .pc-script { display:flex; flex-direction:column; gap:8px; max-height:280px; overflow-y:auto; padding:4px 0; }
+        .pc-turn { display:flex; gap:8px; font-size:13px; line-height:1.5; }
+        .pc-speaker { font-weight:900; min-width:46px; flex-shrink:0; }
+        .pc-turn.host .pc-speaker { color:#5aa8ff; }
+        .pc-turn.guest .pc-speaker { color:#5fe3ff; }
+        .pc-turnText { color:rgba(255,255,255,0.82); }
+      `}</style>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Flashcard inline deck
+// ─────────────────────────────────────────────
+function FlashCardDeck({ cards }: { cards: Array<{ front: string; back: string }> }) {
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+
+  const go = (delta: number) => {
+    setFlipped(false);
+    setTimeout(() => setIdx((i) => Math.max(0, Math.min(cards.length - 1, i + delta))), 120);
+  };
+
+  const card = cards[idx];
+  if (!card) return null;
+
+  return (
+    <div className="fc-root">
+      <div className="fc-counter">{idx + 1} / {cards.length}</div>
+      <div className={`fc-card ${flipped ? "flipped" : ""}`} onClick={() => setFlipped((v) => !v)}>
+        <div className="fc-inner">
+          <div className="fc-face fc-front"><span>{card.front}</span></div>
+          <div className="fc-face fc-back"><span>{card.back}</span></div>
+        </div>
+        <div className="fc-hint">{flipped ? "Click to flip back" : "Click to reveal answer"}</div>
+      </div>
+      <div className="fc-nav">
+        <button className="fc-navBtn" disabled={idx === 0} onClick={() => go(-1)} type="button">←</button>
+        <div className="fc-dots">
+          {cards.slice(Math.max(0, idx - 2), idx + 3).map((_, i) => {
+            const real = Math.max(0, idx - 2) + i;
+            return <div key={real} className={`fc-dot ${real === idx ? "active" : ""}`} />;
+          })}
+        </div>
+        <button className="fc-navBtn" disabled={idx === cards.length - 1} onClick={() => go(1)} type="button">→</button>
+      </div>
+
+      <style jsx>{`
+        .fc-root { display:flex; flex-direction:column; gap:10px; min-width:260px; max-width:460px; }
+        .fc-counter { font-size:10px; font-weight:900; letter-spacing:0.1em; text-transform:uppercase; color:rgba(255,255,255,0.45); }
+        .fc-card { cursor:pointer; perspective:900px; height:140px; }
+        .fc-inner { position:relative; width:100%; height:100%; transform-style:preserve-3d; transition:transform 380ms cubic-bezier(.4,0,.2,1); }
+        .fc-card.flipped .fc-inner { transform:rotateY(180deg); }
+        .fc-face { position:absolute; inset:0; border-radius:16px; border:1px solid rgba(255,255,255,0.12); display:flex; align-items:center; justify-content:center; padding:18px; text-align:center; backface-visibility:hidden; -webkit-backface-visibility:hidden; }
+        .fc-front { background:rgba(10,12,18,0.45); }
+        .fc-back { background:rgba(16,22,40,0.55); border-color:rgba(90,168,255,0.22); transform:rotateY(180deg); }
+        .fc-face span { font-size:14px; font-weight:700; color:rgba(255,255,255,0.9); line-height:1.5; }
+        .fc-hint { font-size:10px; color:rgba(255,255,255,0.3); text-align:center; margin-top:4px; }
+        .fc-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+        .fc-navBtn { width:34px; height:34px; border-radius:50%; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.85); font-size:14px; cursor:pointer; display:grid; place-items:center; transition:background 140ms; }
+        .fc-navBtn:hover:not(:disabled) { background:rgba(255,255,255,0.08); border-color:rgba(95,227,255,0.25); }
+        .fc-navBtn:disabled { opacity:0.28; cursor:default; }
+        .fc-dots { display:flex; gap:5px; align-items:center; }
+        .fc-dot { width:5px; height:5px; border-radius:50%; background:rgba(255,255,255,0.2); transition:background 200ms; }
+        .fc-dot.active { background:rgba(95,227,255,0.8); width:8px; border-radius:4px; }
+      `}</style>
     </div>
   );
 }
