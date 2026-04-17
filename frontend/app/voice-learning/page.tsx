@@ -6,6 +6,7 @@ import { useAuth } from "../../lib/auth-context";
 import { useVoiceSession } from "../../lib/hooks/useVoiceSession";
 import ProfessorScene from "../../components/voice/ProfessorScene";
 import WaterRippleScene from "../../components/voice/WaterRippleScene";
+import PlanetScene from "../../components/voice/PlanetScene";
 import AnimatedBackground from "../../components/AnimatedBackground";
 
 // ---------------------------------------------------------------------------
@@ -309,6 +310,15 @@ export default function VoiceLearningPage() {
 
         /* Main panel */
         .pu-main { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+        /* In session mode: kill the glass box, go full black */
+        .pu-main--session {
+          border-color: transparent !important;
+          background: #000 !important;
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+          box-shadow: none !important;
+        }
+        .pu-main--session::before { display: none !important; }
         .pu-topbar { display: flex; align-items: center; justify-content: flex-end; padding: 16px 20px 0; flex-shrink: 0; }
         .pu-userChip {
           display: flex; align-items: center; gap: 8px;
@@ -420,7 +430,7 @@ export default function VoiceLearningPage() {
         .vl-startBtn:hover { transform: translateY(-2px); }
 
         /* Session */
-        .vl-session { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+        .vl-session { flex: 1; position: relative; min-height: 0; overflow: hidden; background: #000; }
         .vl-sessionHeader {
           position: absolute; top: 0; left: 0; right: 0; z-index: 10;
           display: flex; align-items: center; justify-content: space-between;
@@ -465,7 +475,7 @@ export default function VoiceLearningPage() {
           width: min(380px, 72vw); height: min(380px, 72vw);
         }
         .vl-subtitles {
-          position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
+          position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%); z-index: 2;
           width: 100%; max-width: 560px; min-height: 52px;
           display: flex; align-items: center; justify-content: center;
           padding: 0 24px;
@@ -553,7 +563,9 @@ export default function VoiceLearningPage() {
         </aside>
 
         {/* ── Main panel ───────────────────────────────────────────── */}
-        <main className="pu-glass pu-main">
+        <main className={`pu-glass pu-main${view === "session" ? " pu-main--session" : ""}`}>
+          {/* topbar only in setup; session header handles user chip inline */}
+          {view === "setup" && (
           <div className="pu-topbar">
             {user && (
               <div className="pu-userChip">
@@ -565,6 +577,7 @@ export default function VoiceLearningPage() {
               </div>
             )}
           </div>
+          )}
 
           {/* ── Setup view ─────────────────────────────────────────── */}
           {view === "setup" && (
@@ -692,6 +705,15 @@ export default function VoiceLearningPage() {
           {/* ── Session view ────────────────────────────────────────── */}
           {view === "session" && (
             <div style={{ flex: 1, position: "relative", minHeight: 0, overflow: "hidden" }}>
+              {/* Full-panel Three.js scene — fills the whole panel, no box boundary */}
+              <div style={{ position: "absolute", inset: 0, zIndex: 0 }}>
+                <PlanetScene
+                  voiceState={voiceState}
+                  aiAudioLevel={aiAudioLevel}
+                  audioLevel={audioLevel}
+                />
+              </div>
+
               {/* Controls bar */}
               <div className="vl-sessionHeader">
                 <div className="vl-sessionInfo">
@@ -703,6 +725,16 @@ export default function VoiceLearningPage() {
                   </span>
                 </div>
                 <div className="vl-sessionActions">
+                  {/* User chip in session header */}
+                  {user && (
+                    <div className="pu-userChip" style={{ marginRight: 4 }}>
+                      {user.avatar_url
+                        ? <img src={user.avatar_url} alt="" className="pu-avatarImg" />
+                        : <div className="pu-avatar">{initials}</div>
+                      }
+                      <span className="pu-userName">{user.display_name || user.email || "User"}</span>
+                    </div>
+                  )}
                   <button
                     className={`vl-ctrlBtn${isMuted ? " vl-ctrlMuted" : ""}`}
                     onClick={toggleMute}
@@ -742,20 +774,6 @@ export default function VoiceLearningPage() {
                   <button className="vl-errorDismiss" onClick={() => setErrorMsg("")} type="button">×</button>
                 </div>
               )}
-
-              {/* ── Water ripple — absolute dead-centre ─────────────── */}
-              <div style={{
-                position: "absolute",
-                top: "50%", left: "50%",
-                transform: "translate(-50%, -50%)",
-                width: "min(460px, 82vw)",
-                height: "min(460px, 82vw)",
-              }}>
-                <WaterRippleScene
-                  audioLevel={audioLevel}
-                  aiAudioLevel={aiAudioLevel}
-                />
-              </div>
 
               {/* Subtitle strip */}
               <div className="vl-subtitles">
