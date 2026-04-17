@@ -19,6 +19,7 @@ from app.api.discord_integration import router as discord_router
 from app.api.auth import router as auth_router
 from app.api.podcast_audio import router as podcast_audio_router
 from app.api.quiz import router as quiz_router
+from app.api.voice import router as voice_router
 
 logger = logging.getLogger("prepareup.startup")
 
@@ -126,3 +127,4 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(discord_router, prefix="/api")
 app.include_router(podcast_audio_router, prefix="/api")
 app.include_router(quiz_router, prefix="/api")
+app.include_router(voice_router, prefix="/api")

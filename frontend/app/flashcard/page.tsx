@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import AnimatedBackground from "../../components/AnimatedBackground";
 import { useAuth } from "../../lib/auth-context";
@@ -10,12 +10,14 @@ const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 type Thread = { id: string; title: string | null; updated_at: string; source_session_id: string | null; source_files: Array<{ name: string }> };
 type Card = { front: string; back: string };
 type ViewState = "select" | "generating" | "studying";
+type Difficulty = "easy" | "medium" | "hard";
 
-const FEATURES = [
-  { href: "/flashcard", label: "Flash Cards",  icon: "⊞" },
-  { href: "/podcast",   label: "Podcast",      icon: "🎙" },
-  { href: "/mockquiz",  label: "Mock Test",    icon: "✎" },
-  { href: "/studyguide",label: "Study Guide",  icon: "≡" },
+const FEATURES: Array<{ href: string; label: string; icon: React.ReactNode }> = [
+  { href: "/flashcard",     label: "Flash Cards",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><rect x="5" y="7" width="11" height="8" rx="2"/><path d="M9 5h10v8"/><path d="M8.5 10.5h4"/></svg> },
+  { href: "/podcast",       label: "Podcast",        icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="4" y="13" width="3.5" height="6" rx="1.5"/><rect x="16.5" y="13" width="3.5" height="6" rx="1.5"/><path d="M7.5 19a4.5 4.5 0 0 0 9 0"/></svg> },
+  { href: "/mockquiz",      label: "Mock Test",      icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><circle cx="12" cy="12" r="9"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> },
+  { href: "/studyguide",    label: "Study Guide",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M5.5 6.5A2.5 2.5 0 0 1 8 4h10.5v15H8a2.5 2.5 0 0 0-2.5 2.5"/><path d="M5.5 6.5V20"/><path d="M9.5 8h6"/><path d="M9.5 11h6"/></svg> },
+  { href: "/voice-learning", label: "Voice Learning", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg> },
 ];
 
 export default function FlashcardPage() {
@@ -28,6 +30,7 @@ export default function FlashcardPage() {
   const [view, setView] = useState<ViewState>("select");
   const [error, setError] = useState("");
   const [cardCount, setCardCount] = useState(10);
+  const [difficulty, setDifficulty] = useState<Difficulty>("medium");
   const [idx, setIdx] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [shuffled, setShuffled] = useState<Card[]>([]);
@@ -61,7 +64,7 @@ export default function FlashcardPage() {
           "Content-Type": "application/json",
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
         },
-        body: JSON.stringify({ session_id: sid, output_type: "flash_card", count: cardCount }),
+        body: JSON.stringify({ session_id: sid, output_type: "flash_card", count: cardCount, difficulty }),
       });
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Generation failed"); }
       const data = await res.json();
@@ -76,7 +79,7 @@ export default function FlashcardPage() {
       setError(e instanceof Error ? e.message : "Generation failed.");
       setView("select");
     }
-  }, [cardCount, accessToken]);
+  }, [cardCount, difficulty, accessToken]);
 
   const shuffle = () => {
     const copy = [...cards].sort(() => Math.random() - 0.5);
@@ -98,13 +101,18 @@ export default function FlashcardPage() {
       <div className="fp-root">
         {/* ── Sidebar ── */}
         <aside className="fp-glass fp-sidebar">
-          <div className="fp-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+          <div className="fp-brandRow">
+            <div className="fp-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+            <button className="fp-homeBtn" onClick={() => router.push("/dashboard")} title="Home">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="15" height="15"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9.5z"/><path d="M9 21V12h6v9"/></svg>
+            </button>
+          </div>
           <div className="fp-sectionLabel">MAIN</div>
-          <nav className="fp-nav">
+          <nav className="pu-sideNav">
             {FEATURES.map(f => (
-              <div key={f.href} className={`fp-navItem${f.href === "/flashcard" ? " active" : ""}`} onClick={() => router.push(f.href)}>
-                <span className="fp-navIcon">{f.icon}</span>
-                <span>{f.label}</span>
+              <div key={f.href} className={`pu-sideItem${f.href === "/flashcard" ? " active" : ""}`} onClick={() => router.push(f.href)}>
+                <span className="pu-sideIcon">{f.icon}</span>
+                <div className="pu-sideLabel">{f.label}</div>
               </div>
             ))}
           </nav>
@@ -132,12 +140,24 @@ export default function FlashcardPage() {
               <div className="fp-selectTitle">Flashcard Workspace</div>
               <div className="fp-selectSub">Select a chat from the sidebar to generate flashcards from your notes.</div>
               {error && <div className="fp-error">{error}</div>}
-              <div className="fp-countRow">
-                <span className="fp-countLabel">Cards to generate</span>
-                <div className="fp-countBtns">
-                  {[5, 10, 15, 20].map(n => (
-                    <button key={n} className={`fp-countBtn${cardCount === n ? " active" : ""}`} onClick={() => setCardCount(n)}>{n}</button>
-                  ))}
+              <div className="fp-configPanel">
+                <div className="fp-countRow">
+                  <span className="fp-countLabel">Cards to generate</span>
+                  <div className="fp-countBtns">
+                    {[5, 10, 15, 20].map(n => (
+                      <button key={n} className={`fp-countBtn${cardCount === n ? " active" : ""}`} onClick={() => setCardCount(n)}>{n}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="fp-countRow">
+                  <span className="fp-countLabel">Difficulty</span>
+                  <div className="fp-countBtns">
+                    {(["easy", "medium", "hard"] as Difficulty[]).map(d => (
+                      <button key={d} className={`fp-countBtn${difficulty === d ? " active diff-" + d : ""}`} onClick={() => setDifficulty(d)}>
+                        {d.charAt(0).toUpperCase() + d.slice(1)}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </div>
@@ -159,13 +179,12 @@ export default function FlashcardPage() {
                   <div className="fp-wsEyebrow">FLASHCARD WORKSPACE</div>
                   <div className="fp-wsTitle">Studying: {selected?.title || "Your notes"}</div>
                 </div>
-                <button className="fp-backBtn" onClick={() => { setView("select"); setSelected(null); }}>Back to Chats</button>
               </div>
 
               {/* Stats row */}
               <div className="fp-statsRow">
                 <div className="fp-stat"><div className="fp-statVal">{displayCards.length}</div><div className="fp-statKey">Cards</div></div>
-                <div className="fp-stat"><div className="fp-statVal">Medium</div><div className="fp-statKey">Difficulty</div></div>
+                <div className="fp-stat"><div className={`fp-statVal fp-diff-${difficulty}`}>{difficulty.charAt(0).toUpperCase() + difficulty.slice(1)}</div><div className="fp-statKey">Difficulty</div></div>
                 <div className="fp-stat"><div className="fp-statVal">{idx + 1}</div><div className="fp-statKey">Current Card</div></div>
               </div>
 
@@ -218,17 +237,22 @@ export default function FlashcardPage() {
 
       <style jsx>{`
         :global(body){margin:0;background:#07070b;}
-        .fp-root{position:relative;z-index:1;display:grid;grid-template-columns:240px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
+        .fp-root{position:relative;z-index:1;display:grid;grid-template-columns:340px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
         .fp-glass{border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.5);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);box-shadow:0 20px 60px rgba(0,0,0,0.5);}
         .fp-sidebar{padding:16px;display:flex;flex-direction:column;min-height:0;overflow:hidden;}
         .fp-main{overflow-y:auto;padding:0;}
-        .fp-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:14px;}
+        .fp-brandRow{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+        .fp-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;}
+        .fp-homeBtn{width:28px;height:28px;border-radius:9px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.6);display:grid;place-items:center;cursor:pointer;transition:all 130ms;flex-shrink:0;}
+        .fp-homeBtn:hover{background:rgba(95,227,255,0.1);border-color:rgba(95,227,255,0.3);color:#5fe3ff;}
         .fp-sectionLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;}
-        .fp-nav{display:flex;flex-direction:column;gap:4px;}
-        .fp-navItem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:700;color:rgba(255,255,255,0.75);transition:all 130ms;}
-        .fp-navItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.08);}
-        .fp-navItem.active{background:rgba(255,255,255,0.06);border-color:rgba(95,227,255,0.25);color:rgba(255,255,255,0.95);}
-        .fp-navIcon{font-size:14px;width:18px;text-align:center;}
+        .pu-sideNav{margin-top:8px;display:flex;flex-direction:column;gap:6px;}
+        .pu-sideItem{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,0.08);background:rgba(10,12,18,0.2);cursor:pointer;user-select:none;text-decoration:none;color:rgba(255,255,255,0.88);transition:transform 140ms ease,background 140ms ease,border-color 140ms ease;position:relative;overflow:hidden;}
+        .pu-sideItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(95,227,255,0.18);transform:translateY(-1px);}
+        .pu-sideItem.active{border-color:rgba(95,227,255,0.26);background:rgba(255,255,255,0.05);}
+        .pu-sideItem.active::before{content:"";position:absolute;left:10px;top:10px;bottom:10px;width:3px;border-radius:999px;background:linear-gradient(180deg,#5fe3ff,#5aa8ff);}
+        .pu-sideIcon{width:18px;height:18px;display:grid;place-items:center;color:rgba(255,255,255,0.72);flex-shrink:0;}
+        .pu-sideLabel{font-size:12px;font-weight:900;color:rgba(255,255,255,0.88);}
         .fp-search{margin-top:4px;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;font-size:12px;color:rgba(255,255,255,0.85);outline:none;}
         .fp-search::placeholder{color:rgba(255,255,255,0.35);}
         .fp-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
@@ -247,11 +271,18 @@ export default function FlashcardPage() {
         .fp-selectTitle{font-size:22px;font-weight:950;letter-spacing:-0.02em;color:rgba(255,255,255,0.94);}
         .fp-selectSub{font-size:14px;color:rgba(255,255,255,0.55);line-height:1.6;max-width:420px;}
         .fp-error{font-size:13px;color:#ff6b6b;padding:10px 16px;border-radius:12px;border:1px solid rgba(255,107,107,0.2);background:rgba(255,107,107,0.07);}
-        .fp-countRow{display:flex;flex-direction:column;align-items:center;gap:8px;margin-top:8px;}
+        .fp-configPanel{display:flex;flex-direction:column;gap:14px;margin-top:4px;width:100%;max-width:400px;}
+        .fp-countRow{display:flex;flex-direction:column;align-items:center;gap:8px;}
         .fp-countLabel{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.5);}
-        .fp-countBtns{display:flex;gap:8px;}
+        .fp-countBtns{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;}
         .fp-countBtn{height:34px;padding:0 16px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.82);font-size:13px;font-weight:800;cursor:pointer;transition:all 130ms;}
         .fp-countBtn.active{background:rgba(95,227,255,0.14);border-color:rgba(95,227,255,0.4);color:#5fe3ff;}
+        .fp-countBtn.active.diff-easy{background:rgba(95,200,95,0.14);border-color:rgba(95,200,95,0.4);color:#5fc85f;}
+        .fp-countBtn.active.diff-medium{background:rgba(255,200,90,0.14);border-color:rgba(255,200,90,0.4);color:#ffc85a;}
+        .fp-countBtn.active.diff-hard{background:rgba(255,107,107,0.14);border-color:rgba(255,107,107,0.4);color:#ff6b6b;}
+        .fp-diff-easy{color:#5fc85f !important;}
+        .fp-diff-medium{color:#ffc85a !important;}
+        .fp-diff-hard{color:#ff6b6b !important;}
         .fp-spinner{width:36px;height:36px;border-radius:50%;border:3px solid rgba(255,255,255,0.1);border-top-color:#5aa8ff;animation:spin 0.8s linear infinite;}
         @keyframes spin{to{transform:rotate(360deg)}}
 
@@ -298,7 +329,7 @@ export default function FlashcardPage() {
         .fp-tipCard{padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.07);background:rgba(255,255,255,0.02);}
         .fp-tipHead{font-size:12px;font-weight:900;color:rgba(255,255,255,0.85);margin-bottom:3px;}
         .fp-tipBody{font-size:11px;color:rgba(255,255,255,0.5);line-height:1.5;}
-        @media(max-width:700px){.fp-root{grid-template-columns:1fr;}.fp-sidebar{display:none;}}
+        @media(max-width:900px){.fp-root{grid-template-columns:1fr;}.fp-sidebar{display:none;}}
       `}</style>
     </>
   );

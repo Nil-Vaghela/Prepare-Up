@@ -6,6 +6,16 @@ import { useAuth } from "../lib/auth-context";
 
 const NAV_ITEMS = [
   {
+    href: "/",
+    label: "Home",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+        <path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9.5z" />
+        <path d="M9 21V12h6v9" />
+      </svg>
+    ),
+  },
+  {
     href: "/dashboard",
     label: "Dashboard",
     icon: (
@@ -75,6 +85,18 @@ const NAV_ITEMS = [
     ),
   },
   {
+    href: "/voice-learning",
+    label: "Voice Learning",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+        <line x1="12" y1="19" x2="12" y2="23" />
+        <line x1="8" y1="23" x2="16" y2="23" />
+      </svg>
+    ),
+  },
+  {
     href: "/discord",
     label: "Discord",
     icon: (
@@ -84,6 +106,11 @@ const NAV_ITEMS = [
     ),
   },
 ];
+
+function isNavActive(href: string, pathname: string): boolean {
+  if (href === "/") return pathname === "/";
+  return pathname === href || pathname.startsWith(href + "/");
+}
 
 export default function Sidebar() {
   const pathname = usePathname();
@@ -105,7 +132,7 @@ export default function Sidebar() {
           <Link
             key={item.href}
             href={item.href}
-            className={`pu-sideItem${pathname === item.href || pathname.startsWith(item.href + "/") ? " active" : ""}`}
+            className={`pu-sideItem${isNavActive(item.href, pathname) ? " active" : ""}`}
           >
             <span className="pu-sideIcon" aria-hidden="true">{item.icon}</span>
             <span className="pu-sideLabel">{item.label}</span>

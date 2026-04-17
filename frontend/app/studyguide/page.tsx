@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import AnimatedBackground from "../../components/AnimatedBackground";
 import { useAuth } from "../../lib/auth-context";
@@ -11,11 +11,12 @@ type Thread = { id: string; title: string | null; updated_at: string; source_ses
 type Section = { heading: string; bullets: string[] };
 type ViewState = "select" | "generating" | "reading";
 
-const FEATURES = [
-  { href: "/flashcard",  label: "Flash Cards", icon: "⊞" },
-  { href: "/podcast",    label: "Podcast",     icon: "🎙" },
-  { href: "/mockquiz",   label: "Mock Test",   icon: "✎" },
-  { href: "/studyguide", label: "Study Guide", icon: "≡" },
+const FEATURES: Array<{ href: string; label: string; icon: React.ReactNode }> = [
+  { href: "/flashcard",     label: "Flash Cards",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><rect x="5" y="7" width="11" height="8" rx="2"/><path d="M9 5h10v8"/><path d="M8.5 10.5h4"/></svg> },
+  { href: "/podcast",       label: "Podcast",        icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="4" y="13" width="3.5" height="6" rx="1.5"/><rect x="16.5" y="13" width="3.5" height="6" rx="1.5"/><path d="M7.5 19a4.5 4.5 0 0 0 9 0"/></svg> },
+  { href: "/mockquiz",      label: "Mock Test",      icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><circle cx="12" cy="12" r="9"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> },
+  { href: "/studyguide",    label: "Study Guide",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M5.5 6.5A2.5 2.5 0 0 1 8 4h10.5v15H8a2.5 2.5 0 0 0-2.5 2.5"/><path d="M5.5 6.5V20"/><path d="M9.5 8h6"/><path d="M9.5 11h6"/></svg> },
+  { href: "/voice-learning", label: "Voice Learning", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg> },
 ];
 
 function parseGuide(text: string): Section[] {
@@ -119,11 +120,11 @@ export default function StudyGuidePage() {
         <aside className="sg-glass sg-sidebar">
           <div className="sg-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
           <div className="sg-sectionLabel">MAIN</div>
-          <nav className="sg-nav">
+          <nav className="pu-sideNav">
             {FEATURES.map(f => (
-              <div key={f.href} className={`sg-navItem${f.href === "/studyguide" ? " active" : ""}`} onClick={() => router.push(f.href)}>
-                <span className="sg-navIcon">{f.icon}</span>
-                <span>{f.label}</span>
+              <div key={f.href} className={`pu-sideItem${f.href === "/studyguide" ? " active" : ""}`} onClick={() => router.push(f.href)}>
+                <span className="pu-sideIcon">{f.icon}</span>
+                <div className="pu-sideLabel">{f.label}</div>
               </div>
             ))}
           </nav>
@@ -250,17 +251,19 @@ export default function StudyGuidePage() {
 
       <style jsx>{`
         :global(body){margin:0;background:#07070b;}
-        .sg-root{position:relative;z-index:1;display:grid;grid-template-columns:240px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
+        .sg-root{position:relative;z-index:1;display:grid;grid-template-columns:340px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
         .sg-glass{border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.5);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);box-shadow:0 20px 60px rgba(0,0,0,0.5);}
         .sg-sidebar{padding:16px;display:flex;flex-direction:column;min-height:0;overflow:hidden;}
         .sg-main{overflow-y:auto;padding:0;}
         .sg-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:14px;}
         .sg-sectionLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;}
-        .sg-nav{display:flex;flex-direction:column;gap:4px;}
-        .sg-navItem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:700;color:rgba(255,255,255,0.75);transition:all 130ms;}
-        .sg-navItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.08);}
-        .sg-navItem.active{background:rgba(255,255,255,0.06);border-color:rgba(95,227,255,0.25);color:rgba(255,255,255,0.95);}
-        .sg-navIcon{font-size:14px;width:18px;text-align:center;}
+        .pu-sideNav{margin-top:8px;display:flex;flex-direction:column;gap:6px;}
+        .pu-sideItem{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,0.08);background:rgba(10,12,18,0.2);cursor:pointer;user-select:none;text-decoration:none;color:rgba(255,255,255,0.88);transition:transform 140ms ease,background 140ms ease,border-color 140ms ease;position:relative;overflow:hidden;}
+        .pu-sideItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(95,227,255,0.18);transform:translateY(-1px);}
+        .pu-sideItem.active{border-color:rgba(95,227,255,0.26);background:rgba(255,255,255,0.05);}
+        .pu-sideItem.active::before{content:"";position:absolute;left:10px;top:10px;bottom:10px;width:3px;border-radius:999px;background:linear-gradient(180deg,#5fe3ff,#5aa8ff);}
+        .pu-sideIcon{width:18px;height:18px;display:grid;place-items:center;color:rgba(255,255,255,0.72);flex-shrink:0;}
+        .pu-sideLabel{font-size:12px;font-weight:900;color:rgba(255,255,255,0.88);}
         .sg-search{margin-top:4px;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;font-size:12px;color:rgba(255,255,255,0.85);outline:none;}
         .sg-search::placeholder{color:rgba(255,255,255,0.35);}
         .sg-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
@@ -314,7 +317,7 @@ export default function StudyGuidePage() {
         .sg-ctrlBtn:hover:not(:disabled){background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);transform:translateY(-1px);}
         .sg-ctrlBtn:disabled{opacity:0.3;cursor:default;}
         .sg-ctrlAccent{background:linear-gradient(90deg,rgba(90,168,255,0.9),rgba(95,227,255,0.9));color:rgba(0,0,0,0.85);border-color:transparent;}
-        @media(max-width:700px){.sg-root{grid-template-columns:1fr;}.sg-sidebar{display:none;}}
+        @media(max-width:900px){.sg-root{grid-template-columns:1fr;}.sg-sidebar{display:none;}}
       `}</style>
     </>
   );
