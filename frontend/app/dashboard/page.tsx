@@ -34,10 +34,11 @@ type UploadedFile = {
   textLen: number;
 };
 
-type OutputType = "podcast" | "study_guide" | "narrative" | "flash_card";
+type OutputType = "podcast" | "study_guide" | "narrative" | "flash_card" | "mock_quiz";
 type ChatRole = "user" | "ai";
 
 type PodcastTurn = { speaker: string; text: string };
+type QuizQuestion = { prompt: string; options: string[]; answer: number; explanation: string };
 
 type ChatMessage = {
   id: string;
@@ -55,6 +56,8 @@ type ChatMessage = {
   audioLoading?: boolean;
   // flashcards
   flashCards?: Array<{ front: string; back: string }>;
+  // mock quiz
+  quizQuestions?: QuizQuestion[];
 };
 
 type ChatSession = {
@@ -1806,8 +1809,12 @@ export default function DashboardPage() {
     if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
   };
 
-  const outputLabel = (k: OutputType) =>
-    k === "study_guide" ? "Study Guide" : k === "flash_card" ? "Flash Card" : k[0].toUpperCase() + k.slice(1);
+  const outputLabel = (k: OutputType) => {
+    if (k === "study_guide") return "Study Guide";
+    if (k === "flash_card") return "Flash Cards";
+    if (k === "mock_quiz") return "Mock Quiz";
+    return k[0].toUpperCase() + k.slice(1);
+  };
 
   // -----------------------------
   // Upload to backend
@@ -2047,13 +2054,19 @@ const uploadToBackend = async () => {
     });
 
     try {
-      const res = await authFetch(`${BACKEND_BASE}/api/generate`, {
+      // mock_quiz uses a separate endpoint
+      const apiUrl = k === "mock_quiz"
+        ? `${BACKEND_BASE}/api/quiz/generate`
+        : `${BACKEND_BASE}/api/generate`;
+
+      const apiBody = k === "mock_quiz"
+        ? JSON.stringify({ session_id: resolvedSessionId, count: 10 })
+        : JSON.stringify({ session_id: resolvedSessionId, output_type: k });
+
+      const res = await authFetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: resolvedSessionId,
-          output_type: k,
-        }),
+        body: apiBody,
       });
 
       if (!res.ok) {
@@ -2084,6 +2097,13 @@ const uploadToBackend = async () => {
           ...richFields,
           outputType: "flash_card",
           flashCards: data.cards as Array<{ front: string; back: string }>,
+          text: "",
+        };
+      } else if (k === "mock_quiz" && Array.isArray(data.questions)) {
+        richFields = {
+          ...richFields,
+          outputType: "mock_quiz",
+          quizQuestions: data.questions as QuizQuestion[],
           text: "",
         };
       } else if (typeof data.text === "string") {
@@ -2166,7 +2186,6 @@ const uploadToBackend = async () => {
     setGenerating(true);
 
     const userMsg: ChatMessage = { id: crypto.randomUUID(), role: "user", text };
-
     const aiLoadingId = crypto.randomUUID();
     const aiLoading: ChatMessage = { id: aiLoadingId, role: "ai", text: "Thinking…", loading: true };
 
@@ -2175,6 +2194,88 @@ const uploadToBackend = async () => {
       upsertActiveSession({ messages: next });
       return next;
     });
+
+    // ── Podcast refinement mode ──────────────────────────────────────────────
+    // If the current output is a podcast, route chat input as a refinement
+    // request rather than a regular chat message.
+    const lastPodcastMsg = [...messages].reverse().find(
+      (m) => m.outputType === "podcast" && Array.isArray(m.podcastScript) && m.podcastScript.length > 0
+    );
+    const isPodcastRefinement = selectedOutput === "podcast" && !!lastPodcastMsg;
+
+    if (isPodcastRefinement && lastPodcastMsg) {
+      try {
+        const res = await authFetch(`${BACKEND_BASE}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: resolvedSessionId,
+            output_type: "podcast",
+            refinement_instructions: text,
+            previous_script: lastPodcastMsg.podcastScript,
+          }),
+        });
+
+        if (!res.ok) {
+          const raw = await res.text();
+          throw new Error(extractErrorText(raw) || "Podcast refinement failed");
+        }
+
+        const data = await res.json();
+        const newScript = Array.isArray(data.script) ? data.script as PodcastTurn[] : [];
+        const newSpeakers: [string, string] = Array.isArray(data.speakers) && data.speakers.length >= 2
+          ? [data.speakers[0], data.speakers[1]]
+          : (lastPodcastMsg.podcastSpeakers ?? ["Host", "Guest"]);
+
+        const richFields: Partial<ChatMessage> = {
+          loading: false,
+          outputType: "podcast",
+          podcastSpeakers: newSpeakers,
+          podcastScript: newScript,
+          text: "",
+          audioUrl: undefined,
+          audioLoading: newScript.length > 0,
+        };
+
+        const nextMessages = messages
+          .concat([userMsg, aiLoading])
+          .map((m) => (m.id === aiLoadingId ? { ...m, ...richFields } : m));
+
+        setMessages(nextMessages);
+        upsertActiveSession({ messages: nextMessages });
+        void persistThreadSnapshot({ forceMessages: nextMessages });
+
+        // Auto-fetch new audio in background
+        if (newScript.length > 0) {
+          void (async () => {
+            try {
+              const audioRes = await authFetch(`${BACKEND_BASE}/api/podcast/audio`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ speakers: newSpeakers, script: newScript }),
+              });
+              if (!audioRes.ok) throw new Error("Audio generation failed");
+              const blob = await audioRes.blob();
+              const url = URL.createObjectURL(blob);
+              setMessages((prev) => prev.map((m) => m.id === aiLoadingId ? { ...m, audioUrl: url, audioLoading: false } : m));
+            } catch {
+              setMessages((prev) => prev.map((m) => m.id === aiLoadingId ? { ...m, audioLoading: false } : m));
+            }
+          })();
+        }
+      } catch (e: any) {
+        const nextMessages = messages
+          .concat([userMsg, aiLoading])
+          .map((m) => m.id === aiLoadingId ? { ...m, text: `Error: ${e?.message || "Refinement failed"}`, loading: false } : m);
+        setMessages(nextMessages);
+        upsertActiveSession({ messages: nextMessages });
+        void persistThreadSnapshot({ forceMessages: nextMessages });
+      } finally {
+        setGenerating(false);
+      }
+      return; // skip regular chat path
+    }
+    // ── End podcast refinement mode ──────────────────────────────────────────
 
     try {
       const res = await authFetch(`${BACKEND_BASE}/api/chat`, {
@@ -2537,6 +2638,27 @@ const uploadToBackend = async () => {
           font-size: 12px;
           font-weight: 900;
           color: rgba(255, 255, 255, 0.88);
+        }
+
+        .pu-voiceLink {
+          border-color: rgba(95, 227, 255, 0.15);
+          background: rgba(95, 227, 255, 0.04);
+        }
+        .pu-voiceLink:hover {
+          border-color: rgba(95, 227, 255, 0.28);
+          background: rgba(95, 227, 255, 0.08);
+        }
+        .pu-voiceBadge {
+          margin-left: auto;
+          font-size: 8px;
+          font-weight: 900;
+          letter-spacing: 0.08em;
+          color: rgba(95, 227, 255, 0.85);
+          background: rgba(95, 227, 255, 0.1);
+          border: 1px solid rgba(95, 227, 255, 0.2);
+          border-radius: 999px;
+          padding: 2px 6px;
+          flex-shrink: 0;
         }
 
         .pu-showAll {
@@ -3134,6 +3256,55 @@ const uploadToBackend = async () => {
           cursor: not-allowed;
         }
 
+        .pu-switchOutputRow {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          padding: 10px 14px;
+          border-radius: 14px;
+          border: 1px solid rgba(255,255,255,0.07);
+          background: rgba(255,255,255,0.02);
+          max-width: 620px;
+        }
+
+        .pu-switchLabel {
+          font-size: 11px;
+          font-weight: 700;
+          color: rgba(255,255,255,0.45);
+          white-space: nowrap;
+          flex-shrink: 0;
+        }
+
+        .pu-switchBtn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          height: 28px;
+          padding: 0 12px;
+          border-radius: 999px;
+          border: 1px solid rgba(255,255,255,0.1);
+          background: rgba(255,255,255,0.03);
+          color: rgba(255,255,255,0.75);
+          font-size: 11px;
+          font-weight: 800;
+          cursor: pointer;
+          transition: all 120ms ease;
+          white-space: nowrap;
+        }
+
+        .pu-switchBtn:hover {
+          background: rgba(95,227,255,0.08);
+          border-color: rgba(95,227,255,0.25);
+          color: rgba(255,255,255,0.92);
+          transform: translateY(-1px);
+        }
+
+        .pu-switchBtn:disabled {
+          opacity: 0.4;
+          cursor: not-allowed;
+        }
+
         .pu-chatBarWrap {
           padding: 8px 6px 10px 6px;
         }
@@ -3308,6 +3479,24 @@ const uploadToBackend = async () => {
               </div>
             ))}
           </nav>
+
+          {/* Voice Learning — navigates to dedicated page */}
+          <a
+            href="/voice-learning"
+            className="pu-sideItem pu-voiceLink"
+            style={{ textDecoration: "none", marginTop: 4 }}
+          >
+            <div className="pu-sideIcon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
+            </div>
+            <div className="pu-sideLabel">Voice Learning</div>
+            <div className="pu-voiceBadge">NEW</div>
+          </a>
 
           {chatSessions.length > 0 ? (
             <button className="pu-showAll" type="button" onClick={startNewChat}>
@@ -3797,6 +3986,9 @@ const uploadToBackend = async () => {
                         ) : m.outputType === "flash_card" && !m.loading && Array.isArray(m.flashCards) ? (
                           /* ── Flashcard rich card ── */
                           <FlashCardDeck cards={m.flashCards} />
+                        ) : m.outputType === "mock_quiz" && !m.loading && Array.isArray(m.quizQuestions) ? (
+                          /* ── Mock quiz inline card ── */
+                          <MockQuizCard questions={m.quizQuestions} />
                         ) : (
                           /* ── Plain text (study guide, narrative, chat) ── */
                           <div className={`pu-msgText ${m.loading ? "loading" : ""}`}>{m.text}</div>
@@ -3808,25 +4000,44 @@ const uploadToBackend = async () => {
                   {shouldShowOutputPicker && (
                   <div className="pu-msgRow right">
                     <div className="pu-outputPickerInFeed">
-                      <div className="pu-pickerTitle">What should I make from your notes ??</div>
-                      <div className="pu-pickerSub">Choose one. You can refine the result right after.</div>
+                      <div className="pu-pickerTitle">What should I make from your notes?</div>
+                      <div className="pu-pickerSub">Choose one. You can switch or refine after generating.</div>
                       <div className="pu-outputRow">
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("podcast")} disabled={generating}>
-                          Podcast
+                          🎙 Podcast
                         </button>
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("study_guide")} disabled={generating}>
-                          Study Guide
+                          📖 Study Guide
                         </button>
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("narrative")} disabled={generating}>
-                          Narrative
+                          ✍ Narrative
                         </button>
                         <button className="pu-outputBtn" onClick={() => void onSelectOutput("flash_card")} disabled={generating}>
-                          Flash Cards
+                          ⊞ Flash Cards
+                        </button>
+                        <button className="pu-outputBtn" onClick={() => void onSelectOutput("mock_quiz")} disabled={generating}>
+                          ✎ Mock Quiz
                         </button>
                       </div>
                     </div>
                   </div>
                 )}
+
+                  {/* Switch output type — always visible once content is generated */}
+                  {selectedOutput && !generating && messages.some(m => m.outputType) && (
+                    <div className="pu-msgRow left">
+                      <div className="pu-switchOutputRow">
+                        <span className="pu-switchLabel">Generate a different format:</span>
+                        {(["podcast", "study_guide", "flash_card", "mock_quiz", "narrative"] as OutputType[])
+                          .filter(t => t !== selectedOutput)
+                          .map(t => (
+                            <button key={t} className="pu-switchBtn" onClick={() => { setSelectedOutput(null); void onSelectOutput(t); }} disabled={generating}>
+                              {outputLabel(t)}
+                            </button>
+                          ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Bottom bar */}
@@ -4096,6 +4307,121 @@ function FlashCardDeck({ cards }: { cards: Array<{ front: string; back: string }
         .fc-dots { display:flex; gap:5px; align-items:center; }
         .fc-dot { width:5px; height:5px; border-radius:50%; background:rgba(255,255,255,0.2); transition:background 200ms; }
         .fc-dot.active { background:rgba(95,227,255,0.8); width:8px; border-radius:4px; }
+      `}</style>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Mock Quiz inline card (for dashboard feed)
+// ─────────────────────────────────────────────
+function MockQuizCard({ questions }: { questions: QuizQuestion[] }) {
+  const [currentIdx, setCurrentIdx] = useState(0);
+  const [answered, setAnswered] = useState<number[]>([]);
+  const [done, setDone] = useState(false);
+
+  const q = questions[currentIdx];
+  const chosenIdx = answered[currentIdx] ?? null;
+  const score = answered.filter((a, i) => a === questions[i]?.answer).length;
+
+  const onChoose = (i: number) => {
+    if (chosenIdx !== null) return;
+    setAnswered(prev => { const u = [...prev]; u[currentIdx] = i; return u; });
+  };
+
+  const onNext = () => {
+    if (currentIdx < questions.length - 1) setCurrentIdx(idx => idx + 1);
+    else setDone(true);
+  };
+
+  const onRestart = () => {
+    setCurrentIdx(0);
+    setAnswered([]);
+    setDone(false);
+  };
+
+  if (!q) return null;
+  const pct = questions.length ? Math.round((score / questions.length) * 100) : 0;
+
+  return (
+    <div className="mqi-root">
+      {done ? (
+        <div className="mqi-done">
+          <div className="mqi-score">{pct}%</div>
+          <div className="mqi-doneTitle">{pct >= 80 ? "Great job! 🎉" : pct >= 60 ? "Good effort! 📖" : "Keep studying! 💪"}</div>
+          <div className="mqi-doneSub">{score}/{questions.length} correct</div>
+          <div className="mqi-doneBtns">
+            <button className="mqi-btn mqi-btnAccent" type="button" onClick={onRestart}>Try Again</button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="mqi-header">
+            <div className="mqi-eyebrow">MOCK QUIZ · Q{currentIdx + 1}/{questions.length}</div>
+            <div className="mqi-scoreBadge">{score} correct</div>
+          </div>
+          <div className="mqi-progressTrack">
+            <div className="mqi-progressFill" style={{ width: `${Math.round(((currentIdx) / questions.length) * 100)}%` }} />
+          </div>
+          <div className="mqi-qText">{q.prompt}</div>
+          <div className="mqi-options">
+            {q.options.map((opt, i) => {
+              let cls = "mqi-option";
+              if (chosenIdx !== null) {
+                if (i === q.answer) cls += " correct";
+                else if (i === chosenIdx) cls += " wrong";
+                else cls += " faded";
+              }
+              return (
+                <button key={i} className={cls} type="button" onClick={() => onChoose(i)}>
+                  <span className="mqi-optLabel">{String.fromCharCode(65 + i)}</span>
+                  <span className="mqi-optText">{opt}</span>
+                </button>
+              );
+            })}
+          </div>
+          {chosenIdx !== null && (
+            <div className={`mqi-expl${chosenIdx === q.answer ? " correct" : " wrong"}`}>
+              {chosenIdx === q.answer ? "✓ Correct! " : "✗ Incorrect. "}{q.explanation}
+            </div>
+          )}
+          {chosenIdx !== null && (
+            <div className="mqi-nextRow">
+              <button className="mqi-btn mqi-btnAccent" type="button" onClick={onNext}>
+                {currentIdx < questions.length - 1 ? "Next →" : "See Score"}
+              </button>
+            </div>
+          )}
+        </>
+      )}
+
+      <style jsx>{`
+        .mqi-root { display:flex; flex-direction:column; gap:10px; min-width:280px; max-width:500px; }
+        .mqi-header { display:flex; align-items:center; justify-content:space-between; }
+        .mqi-eyebrow { font-size:10px; font-weight:900; letter-spacing:0.1em; text-transform:uppercase; color:rgba(255,255,255,0.45); }
+        .mqi-scoreBadge { font-size:11px; font-weight:900; color:rgba(255,255,255,0.6); }
+        .mqi-progressTrack { height:4px; border-radius:999px; background:rgba(255,255,255,0.08); overflow:hidden; }
+        .mqi-progressFill { height:100%; border-radius:999px; background:linear-gradient(90deg,#5aa8ff,#5fe3ff); transition:width 300ms ease; }
+        .mqi-qText { font-size:15px; font-weight:900; color:rgba(255,255,255,0.93); line-height:1.45; }
+        .mqi-options { display:flex; flex-direction:column; gap:6px; }
+        .mqi-option { display:flex; align-items:center; gap:10px; padding:10px 14px; border-radius:12px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.03); cursor:pointer; text-align:left; transition:all 130ms; }
+        .mqi-option:hover { background:rgba(255,255,255,0.06); border-color:rgba(95,227,255,0.22); }
+        .mqi-option.correct { border-color:rgba(95,227,100,0.4); background:rgba(95,227,100,0.07); cursor:default; }
+        .mqi-option.wrong { border-color:rgba(255,107,107,0.4); background:rgba(255,107,107,0.07); cursor:default; }
+        .mqi-option.faded { opacity:0.35; cursor:default; }
+        .mqi-optLabel { width:24px; height:24px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:rgba(255,255,255,0.05); display:grid; place-items:center; font-size:11px; font-weight:900; color:rgba(255,255,255,0.7); flex-shrink:0; }
+        .mqi-optText { font-size:13px; font-weight:700; color:rgba(255,255,255,0.88); line-height:1.4; }
+        .mqi-expl { font-size:12px; line-height:1.6; padding:10px 12px; border-radius:12px; }
+        .mqi-expl.correct { border:1px solid rgba(95,227,100,0.2); background:rgba(95,227,100,0.05); color:rgba(255,255,255,0.8); }
+        .mqi-expl.wrong { border:1px solid rgba(255,107,107,0.2); background:rgba(255,107,107,0.05); color:rgba(255,255,255,0.8); }
+        .mqi-nextRow { display:flex; justify-content:flex-end; }
+        .mqi-btn { height:34px; padding:0 16px; border-radius:999px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.85); font-size:12px; font-weight:900; cursor:pointer; transition:all 130ms; }
+        .mqi-btnAccent { background:linear-gradient(90deg,rgba(90,168,255,0.9),rgba(95,227,255,0.9)); color:rgba(0,0,0,0.85); border-color:transparent; }
+        .mqi-done { display:flex; flex-direction:column; align-items:center; gap:8px; text-align:center; padding:16px 0; }
+        .mqi-score { font-size:52px; font-weight:950; letter-spacing:-0.04em; background:linear-gradient(90deg,#5aa8ff,#5fe3ff); -webkit-background-clip:text; background-clip:text; color:transparent; line-height:1; }
+        .mqi-doneTitle { font-size:16px; font-weight:950; color:rgba(255,255,255,0.92); }
+        .mqi-doneSub { font-size:13px; color:rgba(255,255,255,0.55); }
+        .mqi-doneBtns { display:flex; gap:8px; justify-content:center; margin-top:4px; }
       `}</style>
     </div>
   );

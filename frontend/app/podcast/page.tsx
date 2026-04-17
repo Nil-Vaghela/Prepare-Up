@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import AnimatedBackground from "../../components/AnimatedBackground";
 import { useAuth } from "../../lib/auth-context";
@@ -12,11 +12,12 @@ type Turn = { speaker: string; text: string };
 type ViewState = "select" | "generating" | "listening";
 type AudioState = "idle" | "loading" | "ready" | "error";
 
-const FEATURES = [
-  { href: "/flashcard",  label: "Flash Cards", icon: "⊞" },
-  { href: "/podcast",    label: "Podcast",     icon: "🎙" },
-  { href: "/mockquiz",   label: "Mock Test",   icon: "✎" },
-  { href: "/studyguide", label: "Study Guide", icon: "≡" },
+const FEATURES: Array<{ href: string; label: string; icon: React.ReactNode }> = [
+  { href: "/flashcard",     label: "Flash Cards",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><rect x="5" y="7" width="11" height="8" rx="2"/><path d="M9 5h10v8"/><path d="M8.5 10.5h4"/></svg> },
+  { href: "/podcast",       label: "Podcast",        icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M4 13a8 8 0 0 1 16 0"/><rect x="4" y="13" width="3.5" height="6" rx="1.5"/><rect x="16.5" y="13" width="3.5" height="6" rx="1.5"/><path d="M7.5 19a4.5 4.5 0 0 0 9 0"/></svg> },
+  { href: "/mockquiz",      label: "Mock Test",      icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><circle cx="12" cy="12" r="9"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> },
+  { href: "/studyguide",    label: "Study Guide",    icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M5.5 6.5A2.5 2.5 0 0 1 8 4h10.5v15H8a2.5 2.5 0 0 0-2.5 2.5"/><path d="M5.5 6.5V20"/><path d="M9.5 8h6"/><path d="M9.5 11h6"/></svg> },
+  { href: "/voice-learning", label: "Voice Learning", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="18" height="18"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg> },
 ];
 
 export default function PodcastPage() {
@@ -31,6 +32,11 @@ export default function PodcastPage() {
   // Script
   const [speakers, setSpeakers] = useState<[string, string]>(["Host", "Guest"]);
   const [script, setScript] = useState<Turn[]>([]);
+
+  // Refinement
+  const [refineText, setRefineText] = useState("");
+  const [refining, setRefining] = useState(false);
+  const [refineError, setRefineError] = useState("");
 
   // Audio
   const [audioState, setAudioState] = useState<AudioState>("idle");
@@ -106,6 +112,48 @@ export default function PodcastPage() {
     }
   }, [audioUrl, accessToken]);
 
+  const onRefineScript = useCallback(async () => {
+    if (!refineText.trim() || !selected) return;
+    setRefining(true);
+    setRefineError("");
+    const sid = selected.source_session_id;
+    if (!sid) { setRefineError("No session attached to this chat."); setRefining(false); return; }
+    try {
+      const res = await fetch(`${BACKEND}/api/generate`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        },
+        body: JSON.stringify({
+          session_id: sid,
+          output_type: "podcast",
+          refinement_instructions: refineText.trim(),
+          previous_script: script,
+        }),
+      });
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || "Refinement failed"); }
+      const data = await res.json();
+      const turns: Turn[] = Array.isArray(data.script)
+        ? data.script
+        : Array.isArray(data.podcast_script)
+          ? data.podcast_script
+          : [];
+      if (!turns.length) throw new Error("No script returned from refinement.");
+      if (data.speakers?.length >= 2) setSpeakers([data.speakers[0], data.speakers[1]]);
+      setScript(turns);
+      setRefineText("");
+      // Reset audio since script changed
+      if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
+      setAudioState("idle");
+    } catch (e: unknown) {
+      setRefineError(e instanceof Error ? e.message : "Refinement failed.");
+    } finally {
+      setRefining(false);
+    }
+  }, [refineText, selected, script, accessToken, audioUrl]);
+
   const onGenerateAudio = useCallback(async () => {
     if (!script.length) return;
     setAudioState("loading");
@@ -152,13 +200,18 @@ export default function PodcastPage() {
       <div className="pd-root">
         {/* ── Sidebar ── */}
         <aside className="pd-glass pd-sidebar">
-          <div className="pd-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+          <div className="pd-brandRow">
+            <div className="pd-brand" onClick={() => router.push("/dashboard")} style={{ cursor: "pointer" }}>PrepareUp</div>
+            <button className="pd-homeBtn" onClick={() => router.push("/dashboard")} title="Home">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" width="15" height="15"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9.5z"/><path d="M9 21V12h6v9"/></svg>
+            </button>
+          </div>
           <div className="pd-sectionLabel">MAIN</div>
-          <nav className="pd-nav">
+          <nav className="pu-sideNav">
             {FEATURES.map(f => (
-              <div key={f.href} className={`pd-navItem${f.href === "/podcast" ? " active" : ""}`} onClick={() => router.push(f.href)}>
-                <span className="pd-navIcon">{f.icon}</span>
-                <span>{f.label}</span>
+              <div key={f.href} className={`pu-sideItem${f.href === "/podcast" ? " active" : ""}`} onClick={() => router.push(f.href)}>
+                <span className="pu-sideIcon">{f.icon}</span>
+                <div className="pu-sideLabel">{f.label}</div>
               </div>
             ))}
           </nav>
@@ -205,9 +258,7 @@ export default function PodcastPage() {
                   <div className="pd-wsEyebrow">PODCAST WORKSPACE</div>
                   <div className="pd-wsTitle">{selected?.title || "Your notes"}</div>
                 </div>
-                <div className="pd-headerActions">
-                  <button className="pd-backBtn" onClick={() => { setView("select"); setSelected(null); setScript([]); setAudioState("idle"); }}>← Back to Chats</button>
-                </div>
+                <div className="pd-headerActions" />
               </div>
 
               {/* Speakers legend */}
@@ -302,6 +353,34 @@ export default function PodcastPage() {
                   </div>
                 ))}
               </div>
+
+              {/* Refinement panel */}
+              <div className="pd-refinePanel">
+                <div className="pd-refineLabel">REFINE THIS PODCAST</div>
+                <div className="pd-refineSub">Describe changes to the script — tone, focus, length, or specific topics to emphasize.</div>
+                {refineError && <div className="pd-error" style={{ marginBottom: 0 }}>{refineError}</div>}
+                <div className="pd-refineRow">
+                  <textarea
+                    className="pd-refineInput"
+                    placeholder="e.g. Make it shorter and more conversational. Add more examples about the second topic."
+                    value={refineText}
+                    onChange={e => setRefineText(e.target.value)}
+                    rows={3}
+                    disabled={refining}
+                  />
+                  <button
+                    className="pd-ctrlBtn pd-ctrlAccent"
+                    onClick={onRefineScript}
+                    disabled={refining || !refineText.trim()}
+                  >
+                    {refining ? (
+                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <span className="pd-spinnerSm" /> Refining…
+                      </span>
+                    ) : "↺ Regenerate"}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </main>
@@ -309,17 +388,22 @@ export default function PodcastPage() {
 
       <style jsx>{`
         :global(body){margin:0;background:#07070b;}
-        .pd-root{position:relative;z-index:1;display:grid;grid-template-columns:240px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
+        .pd-root{position:relative;z-index:1;display:grid;grid-template-columns:340px 1fr;gap:12px;height:100vh;padding:12px;box-sizing:border-box;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;color:rgba(255,255,255,0.92);-webkit-font-smoothing:antialiased;}
         .pd-glass{border-radius:20px;border:1px solid rgba(255,255,255,0.1);background:rgba(10,12,18,0.5);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);box-shadow:0 20px 60px rgba(0,0,0,0.5);}
         .pd-sidebar{padding:16px;display:flex;flex-direction:column;min-height:0;overflow:hidden;}
         .pd-main{overflow-y:auto;padding:0;}
-        .pd-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:14px;}
+        .pd-brandRow{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+        .pd-brand{font-size:15px;font-weight:950;letter-spacing:-0.02em;background:linear-gradient(90deg,#5aa8ff,#5fe3ff);-webkit-background-clip:text;background-clip:text;color:transparent;}
+        .pd-homeBtn{width:28px;height:28px;border-radius:9px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.6);display:grid;place-items:center;cursor:pointer;transition:all 130ms;flex-shrink:0;}
+        .pd-homeBtn:hover{background:rgba(95,227,255,0.1);border-color:rgba(95,227,255,0.3);color:#5fe3ff;}
         .pd-sectionLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:rgba(255,255,255,0.4);margin-bottom:6px;}
-        .pd-nav{display:flex;flex-direction:column;gap:4px;}
-        .pd-navItem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;border:1px solid transparent;cursor:pointer;font-size:13px;font-weight:700;color:rgba(255,255,255,0.75);transition:all 130ms;}
-        .pd-navItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(255,255,255,0.08);}
-        .pd-navItem.active{background:rgba(255,255,255,0.06);border-color:rgba(95,227,255,0.25);color:rgba(255,255,255,0.95);}
-        .pd-navIcon{font-size:14px;width:18px;text-align:center;}
+        .pu-sideNav{margin-top:8px;display:flex;flex-direction:column;gap:6px;}
+        .pu-sideItem{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,0.08);background:rgba(10,12,18,0.2);cursor:pointer;user-select:none;text-decoration:none;color:rgba(255,255,255,0.88);transition:transform 140ms ease,background 140ms ease,border-color 140ms ease;position:relative;overflow:hidden;}
+        .pu-sideItem:hover{background:rgba(255,255,255,0.04);border-color:rgba(95,227,255,0.18);transform:translateY(-1px);}
+        .pu-sideItem.active{border-color:rgba(95,227,255,0.26);background:rgba(255,255,255,0.05);}
+        .pu-sideItem.active::before{content:"";position:absolute;left:10px;top:10px;bottom:10px;width:3px;border-radius:999px;background:linear-gradient(180deg,#5fe3ff,#5aa8ff);}
+        .pu-sideIcon{width:18px;height:18px;display:grid;place-items:center;color:rgba(255,255,255,0.72);flex-shrink:0;}
+        .pu-sideLabel{font-size:12px;font-weight:900;color:rgba(255,255,255,0.88);}
         .pd-search{margin-top:4px;width:100%;box-sizing:border-box;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:8px 12px;font-size:12px;color:rgba(255,255,255,0.85);outline:none;}
         .pd-search::placeholder{color:rgba(255,255,255,0.35);}
         .pd-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:8px;}
@@ -383,9 +467,21 @@ export default function PodcastPage() {
         .pd-turnText{font-size:14px;line-height:1.65;color:rgba(255,255,255,0.88);}
         /* Buttons */
         .pd-ctrlBtn{display:inline-flex;align-items:center;justify-content:center;height:38px;padding:0 16px;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:rgba(255,255,255,0.85);font-size:12px;font-weight:800;cursor:pointer;transition:all 130ms;white-space:nowrap;text-decoration:none;}
-        .pd-ctrlBtn:hover{background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);transform:translateY(-1px);}
+        .pd-ctrlBtn:hover:not(:disabled){background:rgba(255,255,255,0.07);border-color:rgba(95,227,255,0.22);transform:translateY(-1px);}
+        .pd-ctrlBtn:disabled{opacity:0.4;cursor:default;}
         .pd-ctrlAccent{background:linear-gradient(90deg,rgba(90,168,255,0.9),rgba(95,227,255,0.9));color:rgba(0,0,0,0.85);border-color:transparent;}
-        @media(max-width:700px){.pd-root{grid-template-columns:1fr;}.pd-sidebar{display:none;}}
+        /* Refinement panel */
+        .pd-refinePanel{border-radius:16px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.02);padding:18px;display:flex;flex-direction:column;gap:12px;}
+        .pd-refineLabel{font-size:10px;font-weight:900;letter-spacing:0.1em;text-transform:uppercase;color:#5aa8ff;}
+        .pd-refineSub{font-size:12px;color:rgba(255,255,255,0.5);line-height:1.5;}
+        .pd-refineRow{display:flex;gap:10px;align-items:flex-start;}
+        .pd-refineInput{flex:1;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:10px 14px;font-size:13px;color:rgba(255,255,255,0.88);outline:none;resize:vertical;font-family:inherit;line-height:1.5;min-height:70px;}
+        .pd-refineInput::placeholder{color:rgba(255,255,255,0.3);}
+        .pd-refineInput:focus{border-color:rgba(95,227,255,0.3);}
+        .pd-refineInput:disabled{opacity:0.5;}
+        .pd-spinnerSm{display:inline-block;width:14px;height:14px;border-radius:50%;border:2px solid rgba(0,0,0,0.2);border-top-color:rgba(0,0,0,0.7);animation:spin 0.7s linear infinite;}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @media(max-width:900px){.pd-root{grid-template-columns:1fr;}.pd-sidebar{display:none;}}
       `}</style>
     </>
   );

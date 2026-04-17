@@ -25,6 +25,10 @@ class GenerateRequest(BaseModel):
     session_id: str
     output_type: Literal["flash_card", "study_guide", "podcast", "narrative"]
     count: Optional[int] = Field(default=20, ge=5, le=50)
+    difficulty: Optional[Literal["easy", "medium", "hard"]] = Field(default="medium")
+    # Podcast refinement fields — only used when output_type == "podcast"
+    refinement_instructions: Optional[str] = Field(default=None, max_length=1000)
+    previous_script: Optional[list] = Field(default=None)
 
 
 @router.post("/generate")
@@ -39,6 +43,22 @@ def generate(req: GenerateRequest, request: Request):
 
     corpus = corpus[:60_000]
     count = int(req.count or 20)
+    difficulty = req.difficulty or "medium"
+
+    flashcard_difficulty_instruction = {
+        "easy": (
+            "Focus on basic definitions and key terms. "
+            "The front should ask a simple recall question and the back should be a short, direct answer (max 3 words)."
+        ),
+        "medium": (
+            "Mix basic recall with conceptual questions. "
+            "Some fronts should ask about relationships or processes. Back answers max 3 words."
+        ),
+        "hard": (
+            "Focus on nuanced concepts, edge cases, and comparisons. "
+            "Fronts should require deeper understanding. Back answers max 3 words."
+        ),
+    }[difficulty]
 
     if req.output_type == "flash_card":
         schema = {
@@ -71,10 +91,11 @@ def generate(req: GenerateRequest, request: Request):
             "You are a study assistant. Create high-quality flashcards strictly from the provided content. "
             "NO outside facts. "
             "Each flashcard answer MUST be extremely short: a maximum of THREE WORDS. "
-            "If an answer would be longer than three words, compress it to the shortest correct phrase possible."
+            "If an answer would be longer than three words, compress it to the shortest correct phrase possible. "
+            f"Difficulty level: {difficulty.upper()}. {flashcard_difficulty_instruction}"
         )
 
-        user_instruction = f"CONTENT:\n{corpus}\n\nMake exactly {count} flashcards."
+        user_instruction = f"CONTENT:\n{corpus}\n\nMake exactly {count} flashcards at {difficulty} difficulty."
 
     elif req.output_type == "podcast":
         schema = {
@@ -108,17 +129,34 @@ def generate(req: GenerateRequest, request: Request):
             },
         }
 
-        prompt = (
-            "You are a study assistant. Create a podcast-style dialogue STRICTLY from the provided content. "
-            "No outside facts. Use exactly two speakers (Host and Guest). "
-            "Make it engaging and natural for text-to-speech: short turns, clear phrasing, and occasional recaps. "
-            "Include a brief intro and outro."
-        )
-
-        user_instruction = (
-            f"CONTENT:\n{corpus}\n\n"
-            "Return JSON matching the schema: speakers (2 names) and script (array of turns)."
-        )
+        if req.refinement_instructions and req.previous_script:
+            # Regeneration mode: refine the previous script based on user instructions
+            import json as _json
+            prev_script_str = _json.dumps(req.previous_script, ensure_ascii=False)
+            prompt = (
+                "You are a study assistant. You previously generated a podcast script from the provided content. "
+                "The user wants to refine it. Apply their instructions to produce an improved version "
+                "that stays STRICTLY grounded in the original content. "
+                "Keep the same two-speaker format (Host and Guest). "
+                "Make it engaging and natural for text-to-speech."
+            )
+            user_instruction = (
+                f"ORIGINAL CONTENT:\n{corpus}\n\n"
+                f"PREVIOUS SCRIPT:\n{prev_script_str}\n\n"
+                f"USER REFINEMENT INSTRUCTIONS:\n{req.refinement_instructions}\n\n"
+                "Return JSON matching the schema: speakers (2 names) and script (array of turns)."
+            )
+        else:
+            prompt = (
+                "You are a study assistant. Create a podcast-style dialogue STRICTLY from the provided content. "
+                "No outside facts. Use exactly two speakers (Host and Guest). "
+                "Make it engaging and natural for text-to-speech: short turns, clear phrasing, and occasional recaps. "
+                "Include a brief intro and outro."
+            )
+            user_instruction = (
+                f"CONTENT:\n{corpus}\n\n"
+                "Return JSON matching the schema: speakers (2 names) and script (array of turns)."
+            )
 
     else:
         schema = {

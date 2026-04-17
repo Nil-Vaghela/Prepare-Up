@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -28,6 +28,7 @@ def _get_client() -> OpenAI:
 class QuizRequest(BaseModel):
     session_id: str
     count: Optional[int] = Field(default=10, ge=3, le=30)
+    difficulty: Optional[Literal["easy", "medium", "hard"]] = Field(default="medium")
 
 
 @router.post("/quiz/generate")
@@ -39,6 +40,25 @@ def generate_quiz(req: QuizRequest, request: Request):
 
     corpus = corpus[:50_000]
     count = int(req.count or 10)
+    difficulty = req.difficulty or "medium"
+
+    difficulty_instruction = {
+        "easy": (
+            "Focus on straightforward recall questions. "
+            "Test basic definitions, key facts, and surface-level understanding. "
+            "Options should have one clearly correct answer with clearly wrong distractors."
+        ),
+        "medium": (
+            "Mix recall and application questions. "
+            "Some questions should require understanding relationships between concepts. "
+            "Distractors should be plausible but clearly distinguishable on reflection."
+        ),
+        "hard": (
+            "Focus on application, analysis, and edge cases. "
+            "Questions should require deep understanding and careful reasoning. "
+            "Distractors should be highly plausible and require careful elimination."
+        ),
+    }[difficulty]
 
     # Use OpenAI structured outputs (json_schema) for guaranteed compliance
     json_schema = {
@@ -72,12 +92,12 @@ def generate_quiz(req: QuizRequest, request: Request):
         "No outside facts. Each question must have exactly 4 options with exactly one correct answer. "
         "The 'answer' field is the 0-indexed position of the correct option (0, 1, 2, or 3). "
         "Include a brief explanation (1–2 sentences) for each correct answer. "
-        "Vary difficulty: some questions straightforward, some requiring deeper understanding."
+        f"Difficulty level: {difficulty.upper()}. {difficulty_instruction}"
     )
 
     user_message = (
         f"CONTENT:\n{corpus}\n\n"
-        f"Generate exactly {count} multiple-choice questions from the content above."
+        f"Generate exactly {count} multiple-choice questions at {difficulty} difficulty from the content above."
     )
 
     model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
