@@ -27,6 +27,8 @@ export interface UseVoiceSessionOptions {
   /** PrepareUp upload session ID — used to ground the tutor in study material */
   studySessionId?: string | null;
   voice?: string;
+  /** Language the AI tutor should respond in (e.g. "Hindi", "French"). Defaults to English. */
+  language?: string;
   accessToken?: string | null;
   onError?: (msg: string) => void;
 }
@@ -44,6 +46,8 @@ export interface UseVoiceSessionReturn {
   toggleMute: () => void;
   interruptAI: () => void;
   clearTranscript: () => void;
+  /** Change response language mid-session without restarting WebRTC */
+  changeLanguage: (newLanguage: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +67,7 @@ const REALTIME_MODEL = "gpt-4o-realtime-preview";
 export function useVoiceSession(
   options: UseVoiceSessionOptions = {}
 ): UseVoiceSessionReturn {
-  const { studySessionId, voice = "alloy", accessToken, onError } = options;
+  const { studySessionId, voice = "alloy", language = "English", accessToken, onError } = options;
 
   const [state, setState] = useState<VoiceState>("idle");
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
@@ -363,6 +367,7 @@ export function useVoiceSession(
         body: JSON.stringify({
           session_id: studySessionId ?? null,
           voice,
+          language: language || "English",
         }),
       });
 
@@ -488,6 +493,42 @@ export function useVoiceSession(
     updateState("ended");
   }, [cleanup, updateState]);
 
+  /**
+   * Change the AI tutor's response language mid-session.
+   * Calls the backend to re-generate full instructions (preserving corpus grounding),
+   * then sends a `session.update` event to OpenAI via the existing data channel.
+   */
+  const changeLanguage = useCallback(
+    async (newLanguage: string) => {
+      if (!dcRef.current || dcRef.current.readyState !== "open") return;
+      try {
+        const res = await fetch(`${BACKEND_BASE}/api/voice/update-language`, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+          },
+          body: JSON.stringify({
+            session_id: studySessionId ?? null,
+            language: newLanguage || "English",
+          }),
+        });
+        if (!res.ok) {
+          console.warn("[VoiceSession] changeLanguage: backend returned", res.status);
+          return;
+        }
+        const { instructions } = (await res.json()) as { instructions: string };
+        dcRef.current.send(
+          JSON.stringify({ type: "session.update", session: { instructions } })
+        );
+      } catch (err) {
+        console.error("[VoiceSession] changeLanguage error:", err);
+      }
+    },
+    [studySessionId, accessToken]
+  );
+
   const toggleMute = useCallback(() => {
     const tracks = micStreamRef.current?.getAudioTracks() ?? [];
     const nextMuted = !isMuted;
@@ -515,5 +556,6 @@ export function useVoiceSession(
     toggleMute,
     interruptAI,
     clearTranscript,
+    changeLanguage,
   };
 }

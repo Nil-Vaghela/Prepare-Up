@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "../../lib/auth-context";
 import { useVoiceSession } from "../../lib/hooks/useVoiceSession";
 import ProfessorScene from "../../components/voice/ProfessorScene";
+import WaterRippleScene from "../../components/voice/WaterRippleScene";
+import PlanetScene from "../../components/voice/PlanetScene";
 import AnimatedBackground from "../../components/AnimatedBackground";
 
 // ---------------------------------------------------------------------------
@@ -95,7 +97,35 @@ export default function VoiceLearningPage() {
   const [selectedThread, setSelectedThread] = useState<Thread | null>(null);
   const [selectedVoice, setSelectedVoice] = useState("coral");
   const [errorMsg, setErrorMsg] = useState("");
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
+  const handleVoicePreview = useCallback(async (voice: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    // Stop any currently playing preview
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current = null;
+    }
+    if (previewingVoice === voice) {
+      setPreviewingVoice(null);
+      return;
+    }
+    setPreviewingVoice(voice);
+    try {
+      const res = await fetch(`${BACKEND}/api/voice/preview/${voice}`);
+      if (!res.ok) throw new Error("Preview unavailable");
+      const blob = await res.blob();
+      const url  = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      previewAudioRef.current = audio;
+      audio.onended = () => { setPreviewingVoice(null); URL.revokeObjectURL(url); };
+      audio.onerror = () => { setPreviewingVoice(null); URL.revokeObjectURL(url); };
+      await audio.play();
+    } catch {
+      setPreviewingVoice(null);
+    }
+  }, [previewingVoice]);
   const {
     state: voiceState,
     transcript,
@@ -109,6 +139,7 @@ export default function VoiceLearningPage() {
   } = useVoiceSession({
     studySessionId: selectedThread?.source_session_id ?? null,
     voice: selectedVoice,
+    language: "English",
     accessToken,
     onError: setErrorMsg,
   });
@@ -279,6 +310,15 @@ export default function VoiceLearningPage() {
 
         /* Main panel */
         .pu-main { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+        /* In session mode: kill the glass box, go full black */
+        .pu-main--session {
+          border-color: transparent !important;
+          background: #000 !important;
+          -webkit-backdrop-filter: none !important;
+          backdrop-filter: none !important;
+          box-shadow: none !important;
+        }
+        .pu-main--session::before { display: none !important; }
         .pu-topbar { display: flex; align-items: center; justify-content: flex-end; padding: 16px 20px 0; flex-shrink: 0; }
         .pu-userChip {
           display: flex; align-items: center; gap: 8px;
@@ -327,14 +367,24 @@ export default function VoiceLearningPage() {
         .vl-voiceGrid { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; }
         .vl-voiceBtn {
           background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
-          border-radius: var(--pu-radius-sm); padding: 10px 8px; cursor: pointer;
-          text-align: center; display: flex; flex-direction: column; gap: 3px;
-          transition: background 0.15s, border-color 0.15s;
+          border-radius: var(--pu-radius-sm); padding: 10px 10px 8px; cursor: pointer;
+          text-align: left; display: flex; flex-direction: column; gap: 2px;
+          transition: background 0.15s, border-color 0.15s; position: relative;
         }
         .vl-voiceBtn:hover { background: rgba(255,255,255,0.06); border-color: rgba(255,255,255,0.16); }
         .vl-voiceBtn.selected { background: rgba(95,227,255,0.09); border-color: rgba(95,227,255,0.28); }
         .vl-voiceName { font-size: 12px; font-weight: 900; color: rgba(255,255,255,0.88); }
         .vl-voiceHint { font-size: 10px; font-weight: 600; color: rgba(255,255,255,0.36); }
+        .vl-voicePreviewBtn {
+          position: absolute; top: 7px; right: 7px;
+          width: 22px; height: 22px; border-radius: 50%;
+          display: flex; align-items: center; justify-content: center;
+          background: rgba(95,227,255,0.10); border: 1px solid rgba(95,227,255,0.20);
+          color: rgba(95,227,255,0.8); cursor: pointer;
+          transition: background 0.15s, transform 0.15s;
+        }
+        .vl-voicePreviewBtn:hover { background: rgba(95,227,255,0.22); transform: scale(1.1); }
+        .vl-voicePreviewBtn.playing { background: rgba(95,227,255,0.25); border-color: rgba(95,227,255,0.5); animation: vl-pulse 0.8s ease infinite; }
         .vl-input {
           background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.10);
           border-radius: 10px; padding: 9px 12px; color: rgba(255,255,255,0.9);
@@ -380,9 +430,10 @@ export default function VoiceLearningPage() {
         .vl-startBtn:hover { transform: translateY(-2px); }
 
         /* Session */
-        .vl-session { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+        .vl-session { flex: 1; position: relative; min-height: 0; overflow: hidden; background: #000; }
         .vl-sessionHeader {
-          display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+          position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+          display: flex; align-items: center; justify-content: space-between;
           padding: 14px 18px 0; gap: 10px;
         }
         .vl-sessionInfo { display: flex; align-items: center; gap: 8px; }
@@ -416,7 +467,33 @@ export default function VoiceLearningPage() {
           font-size: 12px; font-weight: 700; color: rgba(255,150,150,0.9); flex-shrink: 0;
         }
         .vl-errorDismiss { margin-left: auto; background: none; border: none; color: rgba(255,150,150,0.55); font-size: 16px; cursor: pointer; }
-        .vl-sceneArea { flex: 1; min-height: 0; position: relative; margin: 10px 0 0; }
+        .vl-sceneArea { display: contents; }
+        .vl-sphereWrap {
+          position: absolute;
+          top: 50%; left: 50%;
+          transform: translate(-50%, -50%);
+          width: min(380px, 72vw); height: min(380px, 72vw);
+        }
+        .vl-subtitles {
+          position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%); z-index: 2;
+          width: 100%; max-width: 560px; min-height: 52px;
+          display: flex; align-items: center; justify-content: center;
+          padding: 0 24px;
+        }
+        .vl-subtitleText {
+          font-size: 14px; font-weight: 600; line-height: 1.6;
+          color: rgba(255,255,255,0.78); text-align: center;
+          background: rgba(10,12,20,0.55);
+          border: 1px solid rgba(255,255,255,0.07);
+          backdrop-filter: blur(14px);
+          border-radius: 16px; padding: 10px 20px;
+          max-height: 80px; overflow: hidden;
+          display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+        }
+        .vl-subtitleHint {
+          font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+          text-transform: uppercase; color: rgba(255,255,255,0.20);
+        }
 
         @media (max-width: 980px) {
           .pu-shell { grid-template-columns: 1fr; }
@@ -486,7 +563,9 @@ export default function VoiceLearningPage() {
         </aside>
 
         {/* ── Main panel ───────────────────────────────────────────── */}
-        <main className="pu-glass pu-main">
+        <main className={`pu-glass pu-main${view === "session" ? " pu-main--session" : ""}`}>
+          {/* topbar only in setup; session header handles user chip inline */}
+          {view === "setup" && (
           <div className="pu-topbar">
             {user && (
               <div className="pu-userChip">
@@ -498,6 +577,7 @@ export default function VoiceLearningPage() {
               </div>
             )}
           </div>
+          )}
 
           {/* ── Setup view ─────────────────────────────────────────── */}
           {view === "setup" && (
@@ -516,6 +596,7 @@ export default function VoiceLearningPage() {
                 </div>
               </div>
 
+
               <div className="vl-body">
                 {/* Voice picker */}
                 <div className="vl-card">
@@ -530,6 +611,22 @@ export default function VoiceLearningPage() {
                       >
                         <div className="vl-voiceName">{v.label}</div>
                         <div className="vl-voiceHint">{v.hint}</div>
+                        <button
+                          className={`vl-voicePreviewBtn${previewingVoice === v.value ? " playing" : ""}`}
+                          onClick={(e) => handleVoicePreview(v.value, e)}
+                          type="button"
+                          title={previewingVoice === v.value ? "Stop preview" : "Preview voice"}
+                        >
+                          {previewingVoice === v.value ? (
+                            <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor">
+                              <rect x="1" y="1" width="2.5" height="7"/><rect x="5.5" y="1" width="2.5" height="7"/>
+                            </svg>
+                          ) : (
+                            <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor">
+                              <polygon points="2,1 8,4.5 2,8"/>
+                            </svg>
+                          )}
+                        </button>
                       </button>
                     ))}
                   </div>
@@ -607,7 +704,16 @@ export default function VoiceLearningPage() {
 
           {/* ── Session view ────────────────────────────────────────── */}
           {view === "session" && (
-            <div className="vl-session">
+            <div style={{ flex: 1, position: "relative", minHeight: 0, overflow: "hidden" }}>
+              {/* Full-panel Three.js scene — fills the whole panel, no box boundary */}
+              <div style={{ position: "absolute", inset: 0, zIndex: 0 }}>
+                <PlanetScene
+                  voiceState={voiceState}
+                  aiAudioLevel={aiAudioLevel}
+                  audioLevel={audioLevel}
+                />
+              </div>
+
               {/* Controls bar */}
               <div className="vl-sessionHeader">
                 <div className="vl-sessionInfo">
@@ -619,6 +725,16 @@ export default function VoiceLearningPage() {
                   </span>
                 </div>
                 <div className="vl-sessionActions">
+                  {/* User chip in session header */}
+                  {user && (
+                    <div className="pu-userChip" style={{ marginRight: 4 }}>
+                      {user.avatar_url
+                        ? <img src={user.avatar_url} alt="" className="pu-avatarImg" />
+                        : <div className="pu-avatar">{initials}</div>
+                      }
+                      <span className="pu-userName">{user.display_name || user.email || "User"}</span>
+                    </div>
+                  )}
                   <button
                     className={`vl-ctrlBtn${isMuted ? " vl-ctrlMuted" : ""}`}
                     onClick={toggleMute}
@@ -659,14 +775,15 @@ export default function VoiceLearningPage() {
                 </div>
               )}
 
-              {/* ── 3D Professor Scene — takes the rest of the space ── */}
-              <div className="vl-sceneArea">
-                <ProfessorScene
-                  state={voiceState}
-                  audioLevel={audioLevel}
-                  aiAudioLevel={aiAudioLevel}
-                  lastAIMessage={lastAIMessage}
-                />
+              {/* Subtitle strip */}
+              <div className="vl-subtitles">
+                {lastAIMessage ? (
+                  <div className="vl-subtitleText">{lastAIMessage}</div>
+                ) : (
+                  <span className="vl-subtitleHint">
+                    {voiceState === "connecting" ? "Connecting…" : "Speak to begin"}
+                  </span>
+                )}
               </div>
             </div>
           )}
