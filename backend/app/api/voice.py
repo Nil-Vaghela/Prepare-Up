@@ -62,10 +62,17 @@ Teach everything within the scope of the above document. Use the document as you
 """
 
 
-def _build_instructions(corpus: Optional[str] = None) -> str:
+def _build_instructions(corpus: Optional[str] = None, language: str = "English") -> str:
+    lang_rule = (
+        f"\n\nLANGUAGE RULE (CRITICAL): The student has selected {language} as the response language. "
+        f"You MUST respond ONLY in {language} for every single message — explanations, questions, "
+        f"check-ins, and all spoken output. Do NOT switch to English or any other language, even if the "
+        f"student writes to you in a different language."
+    ) if language and language.strip().lower() not in ("english", "en") else ""
+
     if corpus and corpus.strip():
-        return _TUTOR_WITH_DOC.format(corpus=corpus.strip()[:8_000])
-    return _TUTOR_BASE_NO_DOC
+        return _TUTOR_WITH_DOC.format(corpus=corpus.strip()[:8_000]) + lang_rule
+    return _TUTOR_BASE_NO_DOC + lang_rule
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +85,12 @@ ALLOWED_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", 
 class VoiceSessionRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="PrepareUp upload session to ground the tutor in")
     voice: str = Field(default="alloy", description="OpenAI voice name")
+    language: str = Field(default="English", description="Language the AI tutor should respond in")
+
+
+class LanguageUpdateRequest(BaseModel):
+    session_id: Optional[str] = Field(default=None)
+    language: str = Field(default="English")
 
 
 class VoiceSessionResponse(BaseModel):
@@ -116,7 +129,7 @@ async def create_voice_session(req: VoiceSessionRequest, request: Request):
             # Session not found or not owned — silently continue without context
             pass
 
-    instructions = _build_instructions(corpus)
+    instructions = _build_instructions(corpus, language=req.language or "English")
 
     payload = {
         "model": REALTIME_MODEL,
@@ -161,4 +174,92 @@ async def create_voice_session(req: VoiceSessionRequest, request: Request):
         expires_at=int(client_secret.get("expires_at", 0)),
         openai_session_id=data.get("id", ""),
         model=REALTIME_MODEL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mid-session language update
+# ---------------------------------------------------------------------------
+
+class LanguageUpdateResponse(BaseModel):
+    instructions: str
+
+
+@router.post("/voice/update-language", response_model=LanguageUpdateResponse)
+async def update_session_language(req: LanguageUpdateRequest, request: Request):
+    """
+    Re-generates the full instruction string for an active session with a new language.
+    The frontend sends the returned instructions via a `session.update` data-channel message
+    to apply the language change without restarting the WebRTC connection.
+    """
+    corpus: Optional[str] = None
+    if req.session_id:
+        try:
+            _verify_session_owner(req.session_id, request)
+            raw = _read_session_text(req.session_id).strip()
+            if raw:
+                corpus = raw
+        except Exception:
+            pass
+
+    instructions = _build_instructions(corpus, language=req.language or "English")
+    return LanguageUpdateResponse(instructions=instructions)
+
+
+# ---------------------------------------------------------------------------
+# Voice preview — short TTS sample for each voice
+# ---------------------------------------------------------------------------
+
+_PREVIEW_LINES = {
+    "alloy":   "Hi, I'm Alloy. Clear and neutral — let's get to work.",
+    "coral":   "Hey there, I'm Coral! Warm and friendly — ready to help you study.",
+    "shimmer": "Hello, I'm Shimmer. Soft and calm — we'll go at your pace.",
+    "echo":    "Hello. I'm Echo. Deep and steady — focused learning starts here.",
+    "sage":    "Hi, I'm Sage. Thoughtful and measured — let's think this through together.",
+    "ash":     "Hi, I'm Ash. Crisp and clear — let's make every word count.",
+}
+
+from fastapi.responses import StreamingResponse
+
+
+@router.get("/voice/preview/{voice}")
+async def voice_preview(voice: str):
+    """
+    Returns a short MP3 audio sample of the requested OpenAI TTS voice.
+    Used by the frontend to let users audition voices before starting a session.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured.")
+
+    voice = voice.lower()
+    if voice not in _PREVIEW_LINES:
+        raise HTTPException(status_code=400, detail=f"Unknown voice '{voice}'.")
+
+    text = _PREVIEW_LINES[voice]
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": "tts-1", "voice": voice, "input": text, "response_format": "mp3"},
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI TTS failed ({resp.status_code}): {resp.text[:200]}",
+        )
+
+    audio_bytes = resp.content
+    return StreamingResponse(
+        iter([audio_bytes]),
+        media_type="audio/mpeg",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+            "Content-Length": str(len(audio_bytes)),
+        },
     )
